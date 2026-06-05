@@ -238,6 +238,7 @@ class AuthState(StatesGroup):
 accounts = {}
 groups = {}
 users = {}
+pending_payments = {}
 
 def load_data():
     global accounts, groups, users
@@ -345,7 +346,6 @@ async def link_group(message: types.Message):
     user_id = message.from_user.id
     group_id = str(message.chat.id)
     
-    # Проверяем не привязана ли уже группа
     if group_id in groups:
         owner = groups[group_id]["owner_id"]
         if str(user_id) == owner:
@@ -354,14 +354,12 @@ async def link_group(message: types.Message):
             await message.answer("❌ Эта группа уже привязана к другому аккаунту!")
         return
     
-    # Привязываем группу
     groups[group_id] = {
         "owner_id": str(user_id),
         "created_at": time.time(),
         "total_scans": 0
     }
     
-    # Обновляем пользователя
     uid = str(user_id)
     if uid not in users:
         users[uid] = {"balance": 0, "group_id": None, "total_scans": 0}
@@ -379,7 +377,6 @@ async def link_group(message: types.Message):
 @dp.message(F.text == "/qr")
 async def qr_command(message: types.Message, state: FSMContext):
     if message.chat.type not in ["group", "supergroup"]:
-        # В личке
         await message.answer("📷 Отправьте фото QR-кода для сканирования.")
         await state.set_state(AuthState.waiting_for_qr)
         return
@@ -466,7 +463,6 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await state.clear()
         return
     
-    # Списание средств
     owner_uid = str(owner_id)
     if owner_uid not in users:
         users[owner_uid] = {"balance": 0, "group_id": group_id, "total_scans": 0}
@@ -497,10 +493,11 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
     if result is None:
         await msg.edit_text("❌ Таймаут сканирования")
     elif result.get("success"):
-        # Списываем средства
         users[owner_uid]["balance"] -= PRICE_PER_QR
         users[owner_uid]["total_scans"] = users[owner_uid].get("total_scans", 0) + 1
-        groups[str(group_id)]["total_scans"] = groups[str(group_id)].get("total_scans", 0) + 1
+        
+        if group_id:
+            groups[str(group_id)]["total_scans"] = groups[str(group_id)].get("total_scans", 0) + 1
         
         pwd = acc.get("password", "")
         if pwd:
@@ -554,7 +551,6 @@ async def handle_topup(message: types.Message, state: FSMContext):
         await message.answer("❌ Сумма должна быть больше 0.")
         return
     
-    # Создаём счёт через Crypto Bot
     url = "https://pay.crypt.bot/api/createInvoice"
     headers = {"Content-Type": "application/json", "Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
     payload = {
@@ -569,12 +565,24 @@ async def handle_topup(message: types.Message, state: FSMContext):
         data = response.json()
         
         if data.get("ok"):
+            invoice_id = data.get("result", {}).get("invoice_id")
             invoice_url = data.get("result", {}).get("pay_url", "")
+            
+            pending_payments[message.from_user.id] = {
+                "invoice_id": invoice_id,
+                "amount": amount
+            }
+            
+            builder = InlineKeyboardBuilder()
+            builder.row(InlineKeyboardButton(text="💳 Оплатить", url=invoice_url))
+            builder.row(InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_payment_{invoice_id}"))
+            
             await message.answer(
                 f"💳 <b>Счёт на пополнение</b>\n\n"
                 f"Сумма: <b>${amount:.2f}</b>\n"
-                f"<a href='{invoice_url}'>Оплатить</a>",
-                parse_mode="HTML"
+                f"Нажмите кнопку для оплаты, затем «Я оплатил»",
+                parse_mode="HTML",
+                reply_markup=builder.as_markup()
             )
         else:
             await message.answer(f"❌ Ошибка создания счёта: {data.get('error')}")
@@ -582,6 +590,39 @@ async def handle_topup(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {e}")
     
     await state.clear()
+
+@dp.callback_query(F.data.startswith("check_payment_"))
+async def cb_check_payment(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    invoice_id = callback.data.split("_")[-1]
+    
+    url = "https://pay.crypt.bot/api/getInvoices"
+    headers = {"Content-Type": "application/json", "Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
+    payload = {"invoice_ids": invoice_id}
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        data = response.json()
+        
+        if data.get("ok") and data.get("result", {}).get("items"):
+            invoice = data["result"]["items"][0]
+            status = invoice.get("status")
+            
+            if status == "paid":
+                amount = float(invoice.get("amount", 0))
+                uid = str(user_id)
+                if uid not in users:
+                    users[uid] = {"balance": 0, "group_id": None, "total_scans": 0}
+                users[uid]["balance"] += amount
+                save_users()
+                
+                await callback.message.edit_text(f"✅ Баланс пополнен на <b>${amount:.2f}</b>!", parse_mode="HTML")
+            else:
+                await callback.answer("❌ Платёж ещё не получен. Попробуйте после оплаты.", show_alert=True)
+        else:
+            await callback.answer("❌ Счёт не найден.", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
 
 # ==================== ПРОФИЛЬ ====================
 
@@ -768,8 +809,6 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
 async def cb_admin_price(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Только для админа", show_alert=True)
-    
-    global PRICE_PER_QR
     
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="$3", callback_data="set_price_3"))
