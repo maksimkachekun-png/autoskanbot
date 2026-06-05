@@ -234,6 +234,7 @@ class AuthState(StatesGroup):
     waiting_for_qr = State()
     waiting_topup_amount = State()
     waiting_broadcast = State()
+    waiting_new_price = State()
 
 accounts = {}
 groups = {}
@@ -283,12 +284,6 @@ def get_user_group(user_id: int) -> str:
         return None
     return users[uid].get("group_id")
 
-def get_group_owner(group_id: int) -> int:
-    gid = str(group_id)
-    if gid in groups:
-        return int(groups[gid]["owner_id"])
-    return None
-
 # ==================== КЛАВИАТУРЫ ====================
 
 def main_keyboard():
@@ -323,7 +318,7 @@ async def start(message: types.Message):
         f"🤖 <b>ДОБРО ПОЖАЛОВАТЬ!</b>\n\n"
         f"Я бот для автосканирования QR MAX в группах.\n\n"
         f"📌 <b>КАК ЭТО РАБОТАЕТ:</b>\n"
-        f"1. Добавьте бота в свою группу\n"
+        f"1. Добавьте бота в свою группу (<b>обязательно выдайте права администратора</b>)\n"
         f"2. Напишите в этой группе: /link\n"
         f"3. Группа будет привязана к вашему аккаунту\n"
         f"4. Пополните баланс (кнопка ниже)\n"
@@ -377,6 +372,9 @@ async def link_group(message: types.Message):
 @dp.message(F.text == "/qr")
 async def qr_command(message: types.Message, state: FSMContext):
     if message.chat.type not in ["group", "supergroup"]:
+        if not accounts:
+            await message.answer("❌ Нет доступных аккаунтов для сканирования.")
+            return
         await message.answer("📷 Отправьте фото QR-кода для сканирования.")
         await state.set_state(AuthState.waiting_for_qr)
         return
@@ -397,6 +395,10 @@ async def qr_command(message: types.Message, state: FSMContext):
             f"Цена QR: ${PRICE_PER_QR:.2f}",
             parse_mode="HTML"
         )
+        return
+    
+    if not accounts:
+        await message.answer("❌ Нет доступных аккаунтов для сканирования. Попробуйте позже.")
         return
     
     await message.answer("📷 Отправьте фото QR-кода для сканирования.")
@@ -810,31 +812,35 @@ async def cb_admin_price(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Только для админа", show_alert=True)
     
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="$3", callback_data="set_price_3"))
-    builder.row(InlineKeyboardButton(text="$5", callback_data="set_price_5"))
-    builder.row(InlineKeyboardButton(text="$7", callback_data="set_price_7"))
-    builder.row(InlineKeyboardButton(text="$10", callback_data="set_price_10"))
-    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_stats"))
-    
+    await state.set_state(AuthState.waiting_new_price)
     await callback.message.answer(
-        f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\nВыберите новую цену:",
-        parse_mode="HTML",
-        reply_markup=builder.as_markup()
+        f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\n"
+        f"Введите новую цену в USDT (например 3.50):",
+        parse_mode="HTML"
     )
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("set_price_"))
-async def cb_set_price(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+@dp.message(AuthState.waiting_new_price)
+async def handle_new_price(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        new_price = float(message.text.strip())
+    except:
+        await message.answer("❌ Введите число (например 3.50)")
+        return
+    
+    if new_price <= 0:
+        await message.answer("❌ Цена должна быть больше 0")
         return
     
     global PRICE_PER_QR
-    price = float(callback.data.split("_")[-1])
-    PRICE_PER_QR = price
+    old_price = PRICE_PER_QR
+    PRICE_PER_QR = new_price
     
-    await callback.message.edit_text(f"✅ Цена изменена на <b>${PRICE_PER_QR:.2f}</b>", parse_mode="HTML")
-    await callback.answer()
+    await message.answer(f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>", parse_mode="HTML")
+    await state.clear()
 
 @dp.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: types.CallbackQuery):
