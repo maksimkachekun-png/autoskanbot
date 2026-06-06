@@ -326,17 +326,58 @@ async def validate_token(token: str, device_id: str) -> dict:
         }
         
         resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
+        
+        # Проверяем что ответ не пустой
+        if not resp or not resp.payload:
+            return {"valid": False, "error": "Пустой ответ от сервера"}
+        
         data = unpack(resp.payload)
         
-        if isinstance(data, dict):
-            if data.get("passwordChallenge"):
-                return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
-            if "error" in data:
-                return {"valid": False, "error": data["error"]}
+        # Логируем ответ для отладки
+        logging.info(f"Validate token response: {data}")
         
-        return {"valid": True}
+        if not isinstance(data, dict):
+            return {"valid": False, "error": f"Неизвестный формат ответа: {type(data)}"}
+        
+        # Проверяем на passwordChallenge (2FA)
+        if data.get("passwordChallenge"):
+            return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+        
+        # Проверяем на ошибки
+        if "error" in data:
+            error_msg = data["error"]
+            # Проверяем разные варианты ошибки 2FA
+            if isinstance(error_msg, str):
+                if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
+                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                else:
+                    return {"valid": False, "error": error_msg}
+            elif isinstance(error_msg, dict):
+                error_text = error_msg.get("message", str(error_msg))
+                if "password" in error_text.lower() or "2fa" in error_text.lower():
+                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_text}"}
+                return {"valid": False, "error": error_text}
+            else:
+                return {"valid": False, "error": str(error_msg)}
+        
+        # Проверяем наличие ключей, которые указывают на успешный логин
+        if "user" in data or "session" in data or "ok" in data:
+            return {"valid": True}
+        
+        # Если ответ есть, но мы не поняли что это - считаем валидным
+        # но логируем для анализа
+        if data:
+            logging.warning(f"Unknown response structure: {data}")
+            # Проверяем есть ли в ответе намёки на 2FA
+            data_str = str(data).lower()
+            if "password" in data_str or "2fa" in data_str or "challenge" in data_str:
+                return {"valid": True, "has_2fa": True, "warning": "Обнаружен 2FA в ответе"}
+            return {"valid": True}
+        
+        return {"valid": False, "error": "Не удалось определить статус токена"}
         
     except Exception as e:
+        logging.error(f"Token validation error: {e}")
         return {"valid": False, "error": str(e)}
     finally:
         scanner.conn.close()
@@ -764,44 +805,72 @@ async def handle_document(message: types.Message):
         
         await msg.edit_text(
             f"✅ Файл обработан!\n"
-            f"➕ Добавлено: {added}\n"
+            f"➕ Добавлено токенов: {added}\n"
             f"⏭ Пропущено: {skipped}\n\n"
-            f"🔍 Начинаю проверку токенов... (это может занять время)"
+            f"🔍 Начинаю проверку... Это может занять несколько минут."
         )
         
-        # Проверяем токены
+        # Проверяем ВСЕ токены
         valid = 0
         invalid = 0
         twofa = 0
         to_remove = []
+        twofa_list = []
+        
+        total = len(accounts)
+        checked = 0
         
         for acc_id, acc in list(accounts.items()):
+            checked += 1
             result = await validate_token(acc["token"], acc["device_id"])
             
             if result["valid"]:
                 valid += 1
                 if result.get("has_2fa"):
                     twofa += 1
+                    phone = acc.get("phone", acc_id[:8])
+                    twofa_list.append(f"• {phone}")
             else:
                 invalid += 1
                 to_remove.append(acc_id)
+                error = result.get("error", "неизвестно")
+                phone = acc.get("phone", acc_id[:8])
+                logging.info(f"Invalid token {phone}: {error}")
+            
+            # Обновляем статус каждые 5 токенов или каждый токен если их мало
+            if checked % 5 == 0 or checked == total:
+                await msg.edit_text(
+                    f"🔍 Проверка токенов...\n"
+                    f"Прогресс: {checked}/{total}\n"
+                    f"✅ Валидных: {valid}\n"
+                    f"🔐 С 2FA: {twofa}\n"
+                    f"❌ Битых: {invalid}",
+                    parse_mode="HTML"
+                )
         
         # Удаляем невалидные
         for acc_id in to_remove:
             del accounts[acc_id]
         save_accounts()
         
-        await msg.edit_text(
-            f"✅ Загрузка завершена!\n\n"
-            f"📦 Загружено: <b>{added}</b>\n"
+        result_text = (
+            f"✅ <b>Проверка завершена!</b>\n\n"
+            f"📦 Всего проверено: <b>{total}</b>\n"
             f"✅ Валидных: <b>{valid}</b>\n"
             f"🔐 С 2FA: <b>{twofa}</b>\n"
             f"❌ Удалено: <b>{invalid}</b>\n"
-            f"📊 Всего в базе: <b>{len(accounts)}</b>",
-            parse_mode="HTML"
+            f"📊 Осталось в базе: <b>{len(accounts)}</b>"
         )
         
+        if twofa_list:
+            result_text += f"\n\n<b>🔐 Токены с 2FA ({twofa}):</b>\n" + "\n".join(twofa_list[:15])
+            if len(twofa_list) > 15:
+                result_text += f"\n...и ещё {len(twofa_list) - 15}"
+        
+        await msg.edit_text(result_text, parse_mode="HTML")
+        
     except Exception as e:
+        logging.error(f"Upload error: {e}")
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 def process_content(content: str) -> tuple:
@@ -889,14 +958,21 @@ async def cb_check_tokens(callback: types.CallbackQuery):
     invalid_count = 0
     twofa_count = 0
     invalid_tokens = []
+    twofa_list = []
+    
+    total = len(accounts)
+    checked = 0
     
     for acc_id, acc in list(accounts.items()):
+        checked += 1
         result = await validate_token(acc["token"], acc["device_id"])
         
         if result["valid"]:
             valid_count += 1
             if result.get("has_2fa"):
                 twofa_count += 1
+                phone = acc.get("phone", acc_id[:8])
+                twofa_list.append(f"• {phone}")
         else:
             invalid_count += 1
             phone = acc.get("phone", acc_id[:8])
@@ -905,10 +981,12 @@ async def cb_check_tokens(callback: types.CallbackQuery):
             del accounts[acc_id]
         
         # Обновляем прогресс каждые 5 токенов
-        if (valid_count + invalid_count) % 5 == 0:
+        if checked % 5 == 0 or checked == total:
             await msg.edit_text(
-                f"🔍 Проверено: <b>{valid_count + invalid_count}</b>/{len(accounts) + invalid_count}\n"
-                f"✅ Валидных: {valid_count}\n❌ Битых: {invalid_count}",
+                f"🔍 Проверка: <b>{checked}</b>/{total}\n"
+                f"✅ Валидных: {valid_count}\n"
+                f"🔐 С 2FA: {twofa_count}\n"
+                f"❌ Битых: {invalid_count}",
                 parse_mode="HTML"
             )
     
@@ -922,8 +1000,13 @@ async def cb_check_tokens(callback: types.CallbackQuery):
         f"📊 Осталось в базе: <b>{len(accounts)}</b>"
     )
     
+    if twofa_list:
+        text += f"\n\n<b>🔐 Токены с 2FA:</b>\n" + "\n".join(twofa_list[:15])
+        if len(twofa_list) > 15:
+            text += f"\n...и ещё {len(twofa_list) - 15}"
+    
     if invalid_tokens:
-        text += "\n\n<b>Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
+        text += f"\n\n<b>❌ Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
         if len(invalid_tokens) > 10:
             text += f"\n...и ещё {len(invalid_tokens) - 10}"
     
