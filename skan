@@ -334,47 +334,81 @@ async def validate_token(token: str, device_id: str) -> dict:
         data = unpack(resp.payload)
         
         # Логируем ответ для отладки
-        logging.info(f"Validate token response: {data}")
+        logging.info(f"Validate token response: {data} (type: {type(data)})")
         
-        if not isinstance(data, dict):
-            return {"valid": False, "error": f"Неизвестный формат ответа: {type(data)}"}
-        
-        # Проверяем на passwordChallenge (2FA)
-        if data.get("passwordChallenge"):
-            return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
-        
-        # Проверяем на ошибки
-        if "error" in data:
-            error_msg = data["error"]
-            # Проверяем разные варианты ошибки 2FA
-            if isinstance(error_msg, str):
-                if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
-                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
-                else:
-                    return {"valid": False, "error": error_msg}
-            elif isinstance(error_msg, dict):
-                error_text = error_msg.get("message", str(error_msg))
-                if "password" in error_text.lower() or "2fa" in error_text.lower():
-                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_text}"}
-                return {"valid": False, "error": error_text}
-            else:
-                return {"valid": False, "error": str(error_msg)}
-        
-        # Проверяем наличие ключей, которые указывают на успешный логин
-        if "user" in data or "session" in data or "ok" in data:
+        # Если ответ - число (ID пользователя при успешном логине)
+        if isinstance(data, (int, float)):
+            logging.info(f"Token valid, user ID: {int(data)}")
             return {"valid": True}
         
-        # Если ответ есть, но мы не поняли что это - считаем валидным
-        # но логируем для анализа
+        # Если ответ - список
+        if isinstance(data, list):
+            if len(data) > 0:
+                first_item = data[0]
+                if isinstance(first_item, dict):
+                    # Проверяем на 2FA
+                    if first_item.get("passwordChallenge"):
+                        return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+                    # Проверяем на ошибки в словаре
+                    if "error" in first_item:
+                        error_msg = first_item["error"]
+                        if isinstance(error_msg, str):
+                            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
+                                return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                            else:
+                                return {"valid": False, "error": error_msg}
+                        return {"valid": False, "error": str(error_msg)}
+                elif isinstance(first_item, (int, float)):
+                    # Число в списке - это ID пользователя
+                    logging.info(f"Token valid, user ID from list: {int(first_item)}")
+                    return {"valid": True}
+            # Если список пустой или не содержит ошибок - считаем валидным
+            return {"valid": True}
+        
+        # Если ответ - словарь
+        if isinstance(data, dict):
+            # Проверяем на passwordChallenge (2FA)
+            if data.get("passwordChallenge"):
+                return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+            
+            # Проверяем на ошибки
+            if "error" in data:
+                error_msg = data["error"]
+                # Проверяем на 2FA в ошибке
+                if isinstance(error_msg, str):
+                    if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
+                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                    else:
+                        return {"valid": False, "error": error_msg}
+                elif isinstance(error_msg, dict):
+                    error_text = error_msg.get("message", str(error_msg))
+                    if "password" in error_text.lower() or "2fa" in error_text.lower():
+                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_text}"}
+                    return {"valid": False, "error": error_text}
+                else:
+                    return {"valid": False, "error": str(error_msg)}
+            
+            # Проверяем наличие ключей успешного логина
+            if "user" in data or "session" in data or "ok" in data or "id" in data:
+                return {"valid": True}
+            
+            # Если словарь не пустой и без ошибок - считаем валидным
+            if data:
+                logging.info(f"Token valid, dict response without errors")
+                return {"valid": True}
+        
+        # Если ответ есть, но мы не поняли формат
         if data:
-            logging.warning(f"Unknown response structure: {data}")
-            # Проверяем есть ли в ответе намёки на 2FA
+            logging.warning(f"Unknown response structure but treating as valid: {data}")
             data_str = str(data).lower()
+            # Проверяем на 2FA
             if "password" in data_str or "2fa" in data_str or "challenge" in data_str:
                 return {"valid": True, "has_2fa": True, "warning": "Обнаружен 2FA в ответе"}
-            return {"valid": True}
+            # Если нет явных ошибок - считаем валидным
+            if "error" not in data_str and "invalid" not in data_str:
+                return {"valid": True}
         
-        return {"valid": False, "error": "Не удалось определить статус токена"}
+        return {"valid": False, "error": f"Неизвестный формат ответа: {type(data)} - {str(data)[:200]}"}
         
     except Exception as e:
         logging.error(f"Token validation error: {e}")
