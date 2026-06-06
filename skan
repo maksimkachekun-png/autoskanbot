@@ -235,6 +235,8 @@ class AuthState(StatesGroup):
     waiting_topup_amount = State()
     waiting_broadcast = State()
     waiting_new_price = State()
+    waiting_edit_balance_user = State()
+    waiting_edit_balance_amount = State()
 
 accounts = {}
 groups = {}
@@ -327,29 +329,23 @@ async def validate_token(token: str, device_id: str) -> dict:
         
         resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
         
-        # Проверяем что ответ не пустой
         if not resp or not resp.payload:
             return {"valid": False, "error": "Пустой ответ от сервера"}
         
         data = unpack(resp.payload)
         
-        # Логируем ответ для отладки
         logging.info(f"Validate token response: {data} (type: {type(data)})")
         
-        # Если ответ - число (ID пользователя при успешном логине)
         if isinstance(data, (int, float)):
             logging.info(f"Token valid, user ID: {int(data)}")
             return {"valid": True}
         
-        # Если ответ - список
         if isinstance(data, list):
             if len(data) > 0:
                 first_item = data[0]
                 if isinstance(first_item, dict):
-                    # Проверяем на 2FA
                     if first_item.get("passwordChallenge"):
                         return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
-                    # Проверяем на ошибки в словаре
                     if "error" in first_item:
                         error_msg = first_item["error"]
                         if isinstance(error_msg, str):
@@ -359,22 +355,16 @@ async def validate_token(token: str, device_id: str) -> dict:
                                 return {"valid": False, "error": error_msg}
                         return {"valid": False, "error": str(error_msg)}
                 elif isinstance(first_item, (int, float)):
-                    # Число в списке - это ID пользователя
                     logging.info(f"Token valid, user ID from list: {int(first_item)}")
                     return {"valid": True}
-            # Если список пустой или не содержит ошибок - считаем валидным
             return {"valid": True}
         
-        # Если ответ - словарь
         if isinstance(data, dict):
-            # Проверяем на passwordChallenge (2FA)
             if data.get("passwordChallenge"):
                 return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
             
-            # Проверяем на ошибки
             if "error" in data:
                 error_msg = data["error"]
-                # Проверяем на 2FA в ошибке
                 if isinstance(error_msg, str):
                     if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
                         return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
@@ -388,23 +378,18 @@ async def validate_token(token: str, device_id: str) -> dict:
                 else:
                     return {"valid": False, "error": str(error_msg)}
             
-            # Проверяем наличие ключей успешного логина
             if "user" in data or "session" in data or "ok" in data or "id" in data:
                 return {"valid": True}
             
-            # Если словарь не пустой и без ошибок - считаем валидным
             if data:
                 logging.info(f"Token valid, dict response without errors")
                 return {"valid": True}
         
-        # Если ответ есть, но мы не поняли формат
         if data:
             logging.warning(f"Unknown response structure but treating as valid: {data}")
             data_str = str(data).lower()
-            # Проверяем на 2FA
             if "password" in data_str or "2fa" in data_str or "challenge" in data_str:
                 return {"valid": True, "has_2fa": True, "warning": "Обнаружен 2FA в ответе"}
-            # Если нет явных ошибок - считаем валидным
             if "error" not in data_str and "invalid" not in data_str:
                 return {"valid": True}
         
@@ -430,6 +415,7 @@ def admin_keyboard():
     builder.row(InlineKeyboardButton(text="📊 Мой профиль", callback_data="profile"))
     builder.row(InlineKeyboardButton(text="➕ Загрузить токены", callback_data="admin_upload"))
     builder.row(InlineKeyboardButton(text="🔍 Проверить токены", callback_data="admin_check_tokens"))
+    builder.row(InlineKeyboardButton(text="💰 Изменить баланс", callback_data="admin_edit_balance"))
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"))
     builder.row(InlineKeyboardButton(text="💵 Изменить цену", callback_data="admin_price"))
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
@@ -783,6 +769,124 @@ async def cb_profile(callback: types.CallbackQuery):
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
+# ==================== ИЗМЕНЕНИЕ БАЛАНСА АДМИНОМ ====================
+
+@dp.callback_query(F.data == "admin_edit_balance")
+async def cb_admin_edit_balance(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    await state.set_state(AuthState.waiting_edit_balance_user)
+    
+    if not users:
+        await callback.message.answer("❌ Нет пользователей в базе.")
+        await state.clear()
+        return
+    
+    users_list = "📋 <b>Список пользователей:</b>\n\n"
+    for uid, data in users.items():
+        balance = data.get("balance", 0)
+        scans = data.get("total_scans", 0)
+        group = data.get("group_id", "нет")
+        users_list += f"👤 ID: <code>{uid}</code>\n"
+        users_list += f"💰 Баланс: ${balance:.2f}\n"
+        users_list += f"📷 Сканов: {scans}\n"
+        users_list += f"📌 Группа: {group}\n\n"
+    
+    users_list += "Введите ID пользователя для изменения баланса:"
+    
+    await callback.message.answer(users_list, parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(AuthState.waiting_edit_balance_user)
+async def handle_edit_balance_user(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        user_id = int(message.text.strip())
+    except:
+        await message.answer("❌ Введите корректный ID пользователя (число).")
+        return
+    
+    uid = str(user_id)
+    if uid not in users:
+        await message.answer(f"❌ Пользователь с ID <code>{user_id}</code> не найден.", parse_mode="HTML")
+        return
+    
+    await state.update_data(edit_user_id=user_id)
+    await state.set_state(AuthState.waiting_edit_balance_amount)
+    
+    current_balance = users[uid].get("balance", 0)
+    await message.answer(
+        f"👤 Пользователь: <code>{user_id}</code>\n"
+        f"💰 Текущий баланс: <b>${current_balance:.2f}</b>\n\n"
+        f"Введите <b>новый баланс</b> (число) или используйте:\n"
+        f"• <code>+50</code> — добавить 50\n"
+        f"• <code>-10</code> — снять 10\n"
+        f"• <code>100</code> — установить 100",
+        parse_mode="HTML"
+    )
+
+@dp.message(AuthState.waiting_edit_balance_amount)
+async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    data = await state.get_data()
+    user_id = data.get("edit_user_id")
+    uid = str(user_id)
+    
+    try:
+        amount_str = message.text.strip()
+        
+        if amount_str.startswith("+"):
+            amount = float(amount_str[1:])
+            users[uid]["balance"] = users[uid].get("balance", 0) + amount
+            operation = f"добавлено <b>${amount:.2f}</b>"
+        elif amount_str.startswith("-"):
+            amount = float(amount_str[1:])
+            new_balance = users[uid].get("balance", 0) - amount
+            if new_balance < 0:
+                await message.answer("❌ Баланс не может быть отрицательным!")
+                return
+            users[uid]["balance"] = new_balance
+            operation = f"снято <b>${amount:.2f}</b>"
+        else:
+            amount = float(amount_str)
+            if amount < 0:
+                await message.answer("❌ Баланс не может быть отрицательным!")
+                return
+            old_balance = users[uid].get("balance", 0)
+            users[uid]["balance"] = amount
+            operation = f"установлен <b>${amount:.2f}</b> (было ${old_balance:.2f})"
+        
+        save_users()
+        
+        await message.answer(
+            f"✅ Баланс пользователя <code>{user_id}</code> изменён!\n\n"
+            f"💰 {operation}\n"
+            f"💳 Новый баланс: <b>${users[uid]['balance']:.2f}</b>",
+            parse_mode="HTML"
+        )
+        
+        # Уведомляем пользователя об изменении баланса
+        try:
+            await bot.send_message(
+                user_id,
+                f"💰 Ваш баланс был изменён администратором!\n\n"
+                f"💳 Текущий баланс: <b>${users[uid]['balance']:.2f}</b>",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+    except ValueError:
+        await message.answer("❌ Введите корректное число или используйте форматы:\n• +50 — добавить\n• -10 — снять\n• 100 — установить")
+        return
+    
+    await state.clear()
+
 # ==================== ЗАГРУЗКА ТОКЕНОВ ====================
 
 @dp.callback_query(F.data == "admin_upload")
@@ -844,7 +948,6 @@ async def handle_document(message: types.Message):
             f"🔍 Начинаю проверку... Это может занять несколько минут."
         )
         
-        # Проверяем ВСЕ токены
         valid = 0
         invalid = 0
         twofa = 0
@@ -871,7 +974,6 @@ async def handle_document(message: types.Message):
                 phone = acc.get("phone", acc_id[:8])
                 logging.info(f"Invalid token {phone}: {error}")
             
-            # Обновляем статус каждые 5 токенов или каждый токен если их мало
             if checked % 5 == 0 or checked == total:
                 await msg.edit_text(
                     f"🔍 Проверка токенов...\n"
@@ -882,7 +984,6 @@ async def handle_document(message: types.Message):
                     parse_mode="HTML"
                 )
         
-        # Удаляем невалидные
         for acc_id in to_remove:
             del accounts[acc_id]
         save_accounts()
@@ -1014,7 +1115,6 @@ async def cb_check_tokens(callback: types.CallbackQuery):
             invalid_tokens.append(f"• <code>{phone}</code>: {error}")
             del accounts[acc_id]
         
-        # Обновляем прогресс каждые 5 токенов
         if checked % 5 == 0 or checked == total:
             await msg.edit_text(
                 f"🔍 Проверка: <b>{checked}</b>/{total}\n"
