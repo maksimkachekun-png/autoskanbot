@@ -170,52 +170,6 @@ class QRScanner:
         self.device_id = device_id or str(uuid.uuid4())
         self.conn = MaxConnection()
 
-    def check_alive(self) -> bool:
-        """Проверяет живой ли токен (только логин, без сканирования)"""
-        try:
-            if not self.conn.connect():
-                return False
-            
-            now_ms = int(time.time() * 1000)
-            payload = {
-                "clientSessionId": now_ms & 0x7FFFFFFF,
-                "mt_instanceid": str(uuid.uuid4()),
-                "userAgent": {
-                    "deviceType": "ANDROID", "appVersion": "26.17.1",
-                    "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                    "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                    "arch": "arm64-v8a", "locale": "ru",
-                    "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                    "deviceLocale": "ru"
-                },
-                "deviceId": self.device_id
-            }
-            self.conn.send(Packet(Opcode.SESSION_INIT, pack(payload)))
-            time.sleep(0.5)
-            
-            login_payload = {
-                "token": self.token, "deviceId": self.device_id,
-                "userAgent": {
-                    "deviceType": "ANDROID", "appVersion": "26.17.1",
-                    "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                    "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                    "arch": "arm64-v8a", "locale": "ru",
-                    "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                    "deviceLocale": "ru"
-                }
-            }
-            resp = self.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
-            data = unpack(resp.payload)
-            
-            if isinstance(data, dict) and "error" in data:
-                return False
-            
-            return True
-        except:
-            return False
-        finally:
-            self.conn.close()
-
     def scan(self, track_id: str, qr_link: str) -> dict:
         try:
             if not self.conn.connect():
@@ -330,6 +284,63 @@ def get_user_group(user_id: int) -> str:
         return None
     return users[uid].get("group_id")
 
+# ==================== ВАЛИДАЦИЯ ТОКЕНОВ ====================
+
+async def validate_token(token: str, device_id: str) -> dict:
+    """Проверяет, рабочий ли токен"""
+    scanner = QRScanner(token, device_id)
+    
+    try:
+        if not scanner.conn.connect():
+            return {"valid": False, "error": "Не удалось подключиться к серверу"}
+        
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "clientSessionId": now_ms & 0x7FFFFFFF,
+            "mt_instanceid": str(uuid.uuid4()),
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.17.1",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6712, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            },
+            "deviceId": device_id
+        }
+        
+        scanner.conn.send(Packet(Opcode.SESSION_INIT, pack(payload)))
+        await asyncio.sleep(0.5)
+        
+        login_payload = {
+            "token": token,
+            "deviceId": device_id,
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.17.1",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6712, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            }
+        }
+        
+        resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
+        data = unpack(resp.payload)
+        
+        if isinstance(data, dict):
+            if data.get("passwordChallenge"):
+                return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+            if "error" in data:
+                return {"valid": False, "error": data["error"]}
+        
+        return {"valid": True}
+        
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+    finally:
+        scanner.conn.close()
+
 # ==================== КЛАВИАТУРЫ ====================
 
 def main_keyboard():
@@ -343,6 +354,7 @@ def admin_keyboard():
     builder.row(InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup"))
     builder.row(InlineKeyboardButton(text="📊 Мой профиль", callback_data="profile"))
     builder.row(InlineKeyboardButton(text="➕ Загрузить токены", callback_data="admin_upload"))
+    builder.row(InlineKeyboardButton(text="🔍 Проверить токены", callback_data="admin_check_tokens"))
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast"))
     builder.row(InlineKeyboardButton(text="💵 Изменить цену", callback_data="admin_price"))
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"))
@@ -520,29 +532,8 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await state.clear()
         return
     
-    # Ищем живой аккаунт
-    acc_id = None
-    acc = None
-    dead_ids = []
-    
-    for aid, a in accounts.items():
-        scanner = QRScanner(a["token"], a["device_id"])
-        if scanner.check_alive():
-            acc_id = aid
-            acc = a
-            break
-        else:
-            dead_ids.append(aid)
-    
-    # Удаляем мёртвые аккаунты
-    for did in dead_ids:
-        del accounts[did]
-    
-    if not acc:
-        save_accounts()
-        await msg.edit_text("❌ Нет рабочих аккаунтов для сканирования. Все токены невалидны.")
-        await state.clear()
-        return
+    acc_id = list(accounts.keys())[0]
+    acc = accounts[acc_id]
     
     await msg.edit_text(f"⏳ Сканирую QR...")
     
@@ -717,7 +708,7 @@ async def cb_profile(callback: types.CallbackQuery):
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-# ==================== АДМИНКА ====================
+# ==================== ЗАГРУЗКА ТОКЕНОВ ====================
 
 @dp.callback_query(F.data == "admin_upload")
 async def cb_admin_upload(callback: types.CallbackQuery):
@@ -726,8 +717,7 @@ async def cb_admin_upload(callback: types.CallbackQuery):
     
     await callback.message.answer(
         "📦 Отправьте файл с токенами (.txt, .json или .zip)\n"
-        "Формат как при выгрузке ANDROID из основного бота.\n\n"
-        "<i>Бот автоматически проверит токены и удалит нерабочие.</i>",
+        "Формат как при выгрузке ANDROID из основного бота.",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -744,7 +734,7 @@ async def handle_document(message: types.Message):
         await message.answer("❌ Отправьте файл .txt, .json или .zip")
         return
     
-    msg = await message.answer("⏳ Обрабатываю файл и проверяю токены...")
+    msg = await message.answer("⏳ Обрабатываю файл...")
     
     try:
         file = await bot.get_file(doc.file_id)
@@ -752,7 +742,6 @@ async def handle_document(message: types.Message):
         
         added = 0
         skipped = 0
-        dead = 0
         
         if file_name.endswith('.zip'):
             zip_buffer = BytesIO(file_bytes.read())
@@ -771,30 +760,47 @@ async def handle_document(message: types.Message):
             content = file_bytes.read().decode('utf-8')
             added, skipped = process_content(content)
         
-        # Проверяем все добавленные токены
-        await msg.edit_text(f"⏳ Проверяю {len(accounts)} токенов...")
-        
-        dead_ids = []
-        for acc_id, acc in list(accounts.items()):
-            scanner = QRScanner(acc["token"], acc["device_id"])
-            if not scanner.check_alive():
-                dead_ids.append(acc_id)
-                dead += 1
-                added -= 1
-        
-        for did in dead_ids:
-            del accounts[did]
-        
         save_accounts()
         
         await msg.edit_text(
-            f"✅ Файл обработан и токены проверены!\n\n"
-            f"➕ Рабочих: <b>{added}</b>\n"
-            f"💀 Мёртвых: <b>{dead}</b>\n"
-            f"⏭ Пропущено: <b>{skipped}</b>\n"
-            f"📊 Всего аккаунтов: <b>{len(accounts)}</b>",
+            f"✅ Файл обработан!\n"
+            f"➕ Добавлено: {added}\n"
+            f"⏭ Пропущено: {skipped}\n\n"
+            f"🔍 Начинаю проверку токенов... (это может занять время)"
+        )
+        
+        # Проверяем токены
+        valid = 0
+        invalid = 0
+        twofa = 0
+        to_remove = []
+        
+        for acc_id, acc in list(accounts.items()):
+            result = await validate_token(acc["token"], acc["device_id"])
+            
+            if result["valid"]:
+                valid += 1
+                if result.get("has_2fa"):
+                    twofa += 1
+            else:
+                invalid += 1
+                to_remove.append(acc_id)
+        
+        # Удаляем невалидные
+        for acc_id in to_remove:
+            del accounts[acc_id]
+        save_accounts()
+        
+        await msg.edit_text(
+            f"✅ Загрузка завершена!\n\n"
+            f"📦 Загружено: <b>{added}</b>\n"
+            f"✅ Валидных: <b>{valid}</b>\n"
+            f"🔐 С 2FA: <b>{twofa}</b>\n"
+            f"❌ Удалено: <b>{invalid}</b>\n"
+            f"📊 Всего в базе: <b>{len(accounts)}</b>",
             parse_mode="HTML"
         )
+        
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -865,6 +871,66 @@ def add_account_from_json(data: dict) -> bool:
     }
     return True
 
+# ==================== ПРОВЕРКА ТОКЕНОВ ====================
+
+@dp.callback_query(F.data == "admin_check_tokens")
+async def cb_check_tokens(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    if not accounts:
+        await callback.answer("Нет токенов для проверки", show_alert=True)
+        return
+    
+    await callback.answer("🔍 Начинаю проверку...")
+    msg = await callback.message.answer(f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
+    
+    valid_count = 0
+    invalid_count = 0
+    twofa_count = 0
+    invalid_tokens = []
+    
+    for acc_id, acc in list(accounts.items()):
+        result = await validate_token(acc["token"], acc["device_id"])
+        
+        if result["valid"]:
+            valid_count += 1
+            if result.get("has_2fa"):
+                twofa_count += 1
+        else:
+            invalid_count += 1
+            phone = acc.get("phone", acc_id[:8])
+            error = result.get("error", "неизвестная ошибка")
+            invalid_tokens.append(f"• <code>{phone}</code>: {error}")
+            del accounts[acc_id]
+        
+        # Обновляем прогресс каждые 5 токенов
+        if (valid_count + invalid_count) % 5 == 0:
+            await msg.edit_text(
+                f"🔍 Проверено: <b>{valid_count + invalid_count}</b>/{len(accounts) + invalid_count}\n"
+                f"✅ Валидных: {valid_count}\n❌ Битых: {invalid_count}",
+                parse_mode="HTML"
+            )
+    
+    save_accounts()
+    
+    text = (
+        f"📊 <b>Проверка завершена!</b>\n\n"
+        f"✅ Рабочих: <b>{valid_count}</b>\n"
+        f"🔐 С 2FA: <b>{twofa_count}</b>\n"
+        f"❌ Удалено: <b>{invalid_count}</b>\n"
+        f"📊 Осталось в базе: <b>{len(accounts)}</b>"
+    )
+    
+    if invalid_tokens:
+        text += "\n\n<b>Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
+        if len(invalid_tokens) > 10:
+            text += f"\n...и ещё {len(invalid_tokens) - 10}"
+    
+    await msg.edit_text(text, parse_mode="HTML")
+
+# ==================== АДМИНКА ====================
+
 @dp.callback_query(F.data == "admin_broadcast")
 async def cb_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -894,4 +960,65 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "admin_price")
 async def cb_admin_price(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
-        return await callback
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    await state.set_state(AuthState.waiting_new_price)
+    await callback.message.answer(
+        f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\n"
+        f"Введите новую цену в USDT (например 3.50):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(AuthState.waiting_new_price)
+async def handle_new_price(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        new_price = float(message.text.strip())
+    except:
+        await message.answer("❌ Введите число (например 3.50)")
+        return
+    
+    if new_price <= 0:
+        await message.answer("❌ Цена должна быть больше 0")
+        return
+    
+    global PRICE_PER_QR
+    old_price = PRICE_PER_QR
+    PRICE_PER_QR = new_price
+    
+    await message.answer(f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>", parse_mode="HTML")
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("❌ Только для админа", show_alert=True)
+    
+    total_users = len(users)
+    total_groups = len(groups)
+    total_accounts = len(accounts)
+    total_scans = sum(g.get("total_scans", 0) for g in groups.values())
+    total_earned = sum(u.get("total_scans", 0) * PRICE_PER_QR for u in users.values())
+    
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{total_users}</b>\n"
+        f"👥 Групп: <b>{total_groups}</b>\n"
+        f"📱 Аккаунтов: <b>{total_accounts}</b>\n"
+        f"📷 Всего сканов: <b>{total_scans}</b>\n"
+        f"💰 Заработано: <b>${total_earned:.2f}</b>\n"
+        f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>"
+    )
+    
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
+
+async def main():
+    logging.info("QR Scanner Bot запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
