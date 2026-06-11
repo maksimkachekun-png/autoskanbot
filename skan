@@ -756,17 +756,18 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
 async def process_tokens_with_validation(content: str) -> list:
     """Обрабатывает токены и сразу проверяет их"""
     results = []
-    
-    # Сначала парсим все токены
     parsed_tokens = []
     
+    # Пробуем распарсить как JSON
     try:
         data = json.loads(content)
         parsed = UniversalTokenParser.parse_json_data(data)
-        parsed_tokens.extend(parsed)
-    except json.JSONDecodeError:
+        if parsed:
+            parsed_tokens.extend(parsed)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         pass
     
+    # Если JSON не дал результатов, парсим как текст
     if not parsed_tokens:
         lines = content.strip().split('\n')
         json_objects = []
@@ -786,7 +787,7 @@ async def process_tokens_with_validation(content: str) -> list:
                 if isinstance(data, dict):
                     json_objects.append(data)
                     continue
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
             
             current_block.append(line)
@@ -801,69 +802,86 @@ async def process_tokens_with_validation(content: str) -> list:
         
         for block in text_blocks:
             parsed = UniversalTokenParser.parse_text_block(block)
-            parsed_tokens.extend(parsed)
+            if parsed:
+                parsed_tokens.extend(parsed)
     
     # Проверяем каждый токен
     for token_data in parsed_tokens:
-        token = token_data["token"]
-        phone = token_data.get("phone", "unknown")
-        password = token_data.get("password", "")
-        device_info = token_data.get("device_info", {})
-        custom_payload = token_data.get("custom_payload")
-        
-        result = {
-            "phone": phone,
-            "password": password,
-            "status": "",
-            "error": ""
-        }
-        
-        # Проверяем дубликат
-        if is_duplicate_token(token):
-            result["status"] = "duplicate"
-            results.append(result)
-            continue
-        
-        # Проверяем токен
-        validation = await validate_token(token, device_info.get("deviceId", str(uuid.uuid4())), device_info)
-        
-        if validation["valid"]:
-            if validation.get("has_2fa"):
-                if password:
-                    # 2FA с паролем - добавляем
+        try:
+            token = token_data.get("token", "")
+            phone = token_data.get("phone", "unknown")
+            password = token_data.get("password", "")
+            device_info = token_data.get("device_info", {})
+            custom_payload = token_data.get("custom_payload")
+            
+            if not token:
+                continue
+            
+            result = {
+                "phone": phone,
+                "password": password,
+                "status": "",
+                "error": ""
+            }
+            
+            if is_duplicate_token(token):
+                result["status"] = "duplicate"
+                results.append(result)
+                continue
+            
+            try:
+                validation = await validate_token(
+                    token, 
+                    device_info.get("deviceId", str(uuid.uuid4())), 
+                    device_info
+                )
+            except Exception as e:
+                result["status"] = "error"
+                result["error"] = f"Validation error: {str(e)[:100]}"
+                results.append(result)
+                continue
+            
+            if validation.get("valid"):
+                if validation.get("has_2fa"):
+                    if password:
+                        add_result = add_account(token, device_info, password, phone, custom_payload)
+                        if add_result == "added":
+                            result["status"] = "added"
+                            result["password"] = password
+                        else:
+                            result["status"] = "duplicate"
+                    else:
+                        result["status"] = "2fa_no_pass"
+                        result["error"] = "2FA without password"
+                else:
                     add_result = add_account(token, device_info, password, phone, custom_payload)
                     if add_result == "added":
                         result["status"] = "added"
                         result["password"] = password
                     else:
                         result["status"] = "duplicate"
-                else:
-                    # 2FA без пароля - пропускаем
-                    result["status"] = "2fa_no_pass"
-                    result["error"] = "2FA without password"
             else:
-                # Валидный токен - добавляем
-                add_result = add_account(token, device_info, password, phone, custom_payload)
-                if add_result == "added":
-                    result["status"] = "added"
-                    result["password"] = password
+                error = validation.get("error", "Unknown error")
+                result["status"] = "error"
+                
+                if "password" in error.lower() or "wrong" in error.lower():
+                    result["error"] = f"login.cred: {error[:50]}"
+                elif "spam" in error.lower() or "block" in error.lower():
+                    result["error"] = f"spamblock: {error[:50]}"
+                    result["spam_blocked"] = True
                 else:
-                    result["status"] = "duplicate"
-        else:
-            # Невалидный токен
-            error = validation.get("error", "Unknown error")
-            result["status"] = "error"
-            result["error"] = error
+                    result["error"] = error[:100]
             
-            # Проверяем на спамблок
-            if "spam" in error.lower() or "block" in error.lower():
-                result["spam_blocked"] = True
+            results.append(result)
             
-            # Проверяем на неправильный пароль
-            if "password" in error.lower() or "wrong" in error.lower():
-                result["error"] = f"login.cred: {error}"
-        
-        results.append(result)
+        except Exception as e:
+            logger.error(f"Error processing token: {e}")
+            results.append({
+                "phone": token_data.get("phone", "unknown"),
+                "password": token_data.get("password", ""),
+                "status": "error",
+                "error": f"Processing error: {str(e)[:100]}"
+            })
     
     return results
 
@@ -1386,18 +1404,61 @@ async def handle_document(message: types.Message):
         file = await bot.get_file(doc.file_id)
         file_bytes = await bot.download_file(file.file_path)
         
-        content = file_bytes.read().decode('utf-8')
+        raw_bytes = file_bytes.read()
         
-        # Обрабатываем с валидацией
-        token_results = await process_tokens_with_validation(content)
-        
-        # Подсчитываем статистику
         added = 0
         skipped_duplicate = 0
         skipped_error = 0
         skipped_2fa_no_pass = 0
         removed_from_pool = 0
         spam_blocked = 0
+        
+        token_results = []
+        
+        if file_name.endswith('.zip'):
+            try:
+                zip_buffer = BytesIO(raw_bytes)
+                with zipfile.ZipFile(zip_buffer, 'r') as zf:
+                    for inner_file in zf.namelist():
+                        if not inner_file.endswith(('.txt', '.json')):
+                            continue
+                        try:
+                            content_bytes = zf.read(inner_file)
+                            
+                            content = None
+                            for encoding in ['utf-8', 'cp1251', 'latin-1', 'utf-16']:
+                                try:
+                                    content = content_bytes.decode(encoding)
+                                    break
+                                except:
+                                    continue
+                            
+                            if content is None:
+                                logger.error(f"Cannot decode {inner_file}")
+                                continue
+                            
+                            results = await process_tokens_with_validation(content)
+                            token_results.extend(results)
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing {inner_file}: {e}")
+            except zipfile.BadZipFile:
+                await msg.edit_text("❌ Файл повреждён или не является ZIP архивом")
+                return
+        else:
+            content = None
+            for encoding in ['utf-8', 'cp1251', 'latin-1', 'utf-16']:
+                try:
+                    content = raw_bytes.decode(encoding)
+                    break
+                except:
+                    continue
+            
+            if content is None:
+                await msg.edit_text("❌ Не удалось прочитать файл. Неподдерживаемая кодировка.")
+                return
+            
+            token_results = await process_tokens_with_validation(content)
         
         for result in token_results:
             if result["status"] == "added":
@@ -1415,14 +1476,12 @@ async def handle_document(message: types.Message):
         
         save_accounts()
         
-        # Формируем вывод
         file_type = "📦 ZIP" if file_name.endswith('.zip') else "📄 Файл"
         report = f"👍 {file_type} обработан\n\n"
         report += f"Добавлено: {added} · Пропущено (уже в базе): {skipped_duplicate} · Ошибок: {skipped_error}\n"
         report += f"Пропуск (2FA без пароля): {skipped_2fa_no_pass} · Удалено из пула: {removed_from_pool}\n"
         report += f"Со спамблоком: {spam_blocked} из добавленных\n\n"
         
-        # Добавляем каждый токен
         for result in token_results:
             phone = result.get("phone", "unknown")
             password = result.get("password", "")
@@ -1443,11 +1502,30 @@ async def handle_document(message: types.Message):
             elif status == "removed":
                 report += f"· {phone} 🗑 удалён\n"
         
-        await msg.edit_text(report)
+        if len(report) > 4000:
+            parts = []
+            current_part = ""
+            
+            for line in report.split('\n'):
+                if len(current_part) + len(line) + 1 > 4000:
+                    parts.append(current_part)
+                    current_part = line + '\n'
+                else:
+                    current_part += line + '\n'
+            
+            if current_part:
+                parts.append(current_part)
+            
+            await msg.edit_text(parts[0])
+            
+            for part in parts[1:]:
+                await message.answer(part)
+        else:
+            await msg.edit_text(report)
         
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:500]}")
 
 # ==================== ПРОВЕРКА ТОКЕНОВ ====================
 
